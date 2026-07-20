@@ -2402,20 +2402,6 @@ async def dm_cmd(interaction: discord.Interaction, member: discord.Member, messa
     except:
         await interaction.followup.send(f"Could not DM {member.display_name}.", ephemeral=True)
 
-@tree.command(name="warndm", description="Send a formal warning DM without logging it (Senior Staff+)", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(member="User", reason="Reason")
-async def warndm_cmd(interaction: discord.Interaction, member: discord.Member, reason: str):
-    await interaction.response.defer(ephemeral=True)
-    if not is_senior(interaction.user): await interaction.followup.send("Senior Staff+ only.", ephemeral=True); return
-    try:
-        e = discord.Embed(description=f"You have received a formal notice from the Ryanair staff team.\n\n**Reason:** {reason}\n\n**Issued by:** {interaction.user.display_name}\n\nPlease ensure this does not happen again.", color=RYANAIR_COLOR)
-        e.set_footer(text="Ryanair Digital Assistant — Staff Notice")
-        await member.send(embed=e)
-        await interaction.channel.send(embed=plain_embed(f"Formal notice sent to {member.mention}.\n**Reason:** {reason}"))
-        await interaction.followup.send("Notice sent.", ephemeral=True)
-    except:
-        await interaction.followup.send(f"Could not DM {member.display_name}.", ephemeral=True)
-
 @tree.command(name="readonly", description="Make a channel read-only with selected roles able to send (Owner only)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(channel="Channel", role1="Role 1", role2="Role 2", role3="Role 3")
 async def readonly(interaction: discord.Interaction, channel: discord.TextChannel, role1: discord.Role, role2: discord.Role, role3: discord.Role):
@@ -2832,25 +2818,20 @@ async def config_cmd(interaction: discord.Interaction):
     except:
         await interaction.followup.send(embed=e, ephemeral=True)
 
-welcome_group = app_commands.Group(name="welcome", description="Welcome system configuration", guild_ids=[GUILD_ID])
-
-@welcome_group.command(name="enable", description="Enable the welcome system (Owner only)")
-@app_commands.describe(channel="Welcome channel", banner_url="Banner image URL")
-async def welcome_enable(interaction: discord.Interaction, channel: discord.TextChannel, banner_url: str = None):
+@tree.command(name="welcome", description="Enable or disable the welcome system (Owner only)", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(enabled="True to enable, False to disable", channel="Welcome channel", banner_url="Banner image URL")
+async def welcome_cmd(interaction: discord.Interaction, enabled: bool, channel: discord.TextChannel = None, banner_url: str = None):
     await interaction.response.defer(ephemeral=True)
     if not is_lock(interaction.user): await interaction.followup.send("Owner only.", ephemeral=True); return
-    welcome_config[str(interaction.guild_id)] = {"channel_id": channel.id, "banner_url": banner_url or SUPPORT_BANNER}
-    save_data()
-    await interaction.followup.send(f"Welcome system enabled in {channel.mention}.", ephemeral=True)
+    if enabled:
+        if not channel: await interaction.followup.send("Please provide a channel when enabling.", ephemeral=True); return
+        welcome_config[str(interaction.guild_id)] = {"channel_id": channel.id, "banner_url": banner_url or SUPPORT_BANNER}
+        save_data()
+        await interaction.followup.send(f"Welcome system enabled in {channel.mention}.", ephemeral=True)
+    else:
+        welcome_config.pop(str(interaction.guild_id), None); save_data()
+        await interaction.followup.send("Welcome system disabled.", ephemeral=True)
 
-@welcome_group.command(name="disable", description="Disable the welcome system (Owner only)")
-async def welcome_disable(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    if not is_lock(interaction.user): await interaction.followup.send("Owner only.", ephemeral=True); return
-    welcome_config.pop(str(interaction.guild_id), None); save_data()
-    await interaction.followup.send("Welcome system disabled.", ephemeral=True)
-
-tree.add_command(welcome_group)
 
 # ── UTILITY ───────────────────────────────────────────────────────────────────
 @tree.command(name="membercount", description="View the current server member count", guild=discord.Object(id=GUILD_ID))
@@ -3849,27 +3830,6 @@ async def mpause_cmd(interaction: discord.Interaction):
     else:
         await interaction.followup.send("Nothing is playing.", ephemeral=True)
 
-@tree.command(name="mqueue", description="Show the current music queue", guild=discord.Object(id=GUILD_ID))
-async def mqueue_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    if interaction.user.id not in music_access:
-        await interaction.followup.send("Type `!acceptmusicrules` first.", ephemeral=True); return
-    gid = interaction.guild_id
-    q = music_queues.get(gid, [])
-    current = music_current.get(gid)
-    if not current and not q:
-        await interaction.followup.send(embed=music_embed("Queue is empty."), ephemeral=True); return
-    desc = ""
-    if current: desc += f"**Now Playing:**\n{current['title']} — {current['artist']} ({format_duration(current['duration'])})\n\n"
-    if q:
-        desc += "**Up Next:**\n"
-        for i, t in enumerate(q[:10], 1):
-            desc += f"{i}. {t['title']} — {t['artist']} ({format_duration(t['duration'])})\n"
-        if len(q) > 10: desc += f"\n...and {len(q)-10} more."
-    e = discord.Embed(title=f"Music Queue ({len(q)} songs)", description=desc, color=0x073590)
-    e.set_footer(text="Ryanair Music System")
-    await interaction.followup.send(embed=e, ephemeral=True)
-
 @tree.command(name="mstop", description="Stop music and disconnect from voice channel", guild=discord.Object(id=GUILD_ID))
 async def mstop_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -3880,6 +3840,5 @@ async def mstop_cmd(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc: vc.stop(); await vc.disconnect()
     await interaction.followup.send(embed=music_embed("Stopped and disconnected."), ephemeral=False)
-
 
 asyncio.run(main())
