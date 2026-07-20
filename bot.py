@@ -3763,6 +3763,609 @@ async def musicstatus_cmd(interaction: discord.Interaction):
 
 print("Music system loaded successfully.")
 
+
+# ══ MUSIC SYSTEM ══════════════════════════════════════════════════════════════
+import discord
+from discord.ext import commands
+import asyncio
+import os
+import json
+import datetime
+import yt_dlp
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+from groq import Groq
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+GUILD_ID              = int(os.getenv("GUILD_ID"))
+GROQ_API_KEY          = os.getenv("GROQ_API_KEY")
+SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+sp = None
+if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+    try:
+        sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET
+        ))
+    except Exception as e:
+        print(f"Spotify init failed: {e}")
+
+# ── STATE ─────────────────────────────────────────────────────────────────────
+music_access  = set()   # user_ids who accepted rules
+music_banned  = set()   # user_ids banned from music
+music_queues  = {}      # guild_id -> list of track dicts
+music_current = {}      # guild_id -> current track dict
+music_effects = {}      # guild_id -> effect string
+music_volume  = {}      # guild_id -> int 0-200
+music_loop    = {}      # guild_id -> bool
+
+MUSIC_DATA_FILE = "music_data.json"
+
+def load_music_data():
+    global music_access, music_banned
+    if os.path.exists(MUSIC_DATA_FILE):
+        with open(MUSIC_DATA_FILE, "r") as f:
+            data = json.load(f)
+            music_access = set(int(x) for x in data.get("music_access", []))
+            music_banned = set(int(x) for x in data.get("music_banned", []))
+
+def save_music_data():
+    with open(MUSIC_DATA_FILE, "w") as f:
+        json.dump({
+            "music_access": list(music_access),
+            "music_banned": list(music_banned),
+        }, f, indent=2)
+
+load_music_data()
+
+# ── YTDLP ─────────────────────────────────────────────────────────────────────
+YTDL_OPTS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "ytsearch",
+    "noplaylist": True,
+}
+
+FFMPEG_BASE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+
+EFFECTS = {
+    "normal":    "",
+    "3d":        "apulsator=hz=0.125",
+    "8d":        "apulsator=hz=0.08",
+    "bassboost": "bass=g=20,dynaudnorm=f=200",
+    "nightcore": "aresample=48000,asetrate=48000*1.25",
+    "slowdown":  "aresample=48000,asetrate=48000*0.8",
+    "vaporwave": "aresample=48000,asetrate=48000*0.8,atempo=1.0",
+    "echo":      "aecho=0.8:0.88:60:0.4",
+    "karaoke":   "pan=stereo|c0=c0-c1|c1=c1-c0",
+}
+
+INAPPROPRIATE_KEYWORDS = [
+    "sex","porn","xxx","nude","explicit","nsfw","fuck","shit","nigger","nigga",
+    "bitch","rape","murder","kill yourself","suicide","cocaine","heroin","meth",
+    "terrorist","isis","hitler","nazi","gore","torture"
+]
+
+def format_duration(seconds):
+    if not seconds: return "Live"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+def music_embed(description, color=0x073590, title=None):
+    e = discord.Embed(description=description, color=color)
+    if title: e.title = title
+    e.set_footer(text="Ryanair Music System")
+    return e
+
+async def is_appropriate(title, artist=""):
+    text = f"{title} {artist}".lower()
+    for kw in INAPPROPRIATE_KEYWORDS:
+        if kw in text:
+            return False, f"Contains inappropriate content: `{kw}`"
+    if not groq_client:
+        return True, ""
+    try:
+        resp = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a content moderator for a family-friendly Discord music bot. Respond ONLY with: APPROPRIATE or INAPPROPRIATE: [brief reason]"},
+                {"role": "user", "content": f"Song: {title} by {artist}. Is this appropriate for a public family-friendly server?"}
+            ],
+            max_tokens=60,
+        )
+        result = resp.choices[0].message.content.strip()
+        if result.startswith("INAPPROPRIATE"):
+            reason = result.split(":",1)[1].strip() if ":" in result else "AI flagged as inappropriate."
+            return False, reason
+        return True, ""
+    except:
+        return True, ""
+
+async def search_youtube(query):
+    try:
+        loop = asyncio.get_event_loop()
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            if query.startswith("http"):
+                info = await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
+            else:
+                info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch:{query}", download=False))
+                if "entries" in info:
+                    info = info["entries"][0]
+            return {
+                "url":       info.get("url") or info.get("webpage_url"),
+                "title":     info.get("title", "Unknown"),
+                "artist":    info.get("uploader", "Unknown"),
+                "duration":  info.get("duration", 0),
+                "webpage":   info.get("webpage_url", ""),
+                "thumbnail": info.get("thumbnail", ""),
+                "source":    "youtube",
+            }
+    except Exception as ex:
+        print(f"YouTube search error: {ex}")
+        return None
+
+async def search_spotify(query):
+    if not sp:
+        return await search_youtube(query)
+    try:
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, lambda: sp.search(q=query, limit=1, type="track"))
+        if not results or not results["tracks"]["items"]:
+            return await search_youtube(query)
+        track = results["tracks"]["items"][0]
+        title  = track["name"]
+        artist = track["artists"][0]["name"]
+        duration = track["duration_ms"] // 1000
+        thumbnail = track["album"]["images"][0]["url"] if track["album"]["images"] else ""
+        yt = await search_youtube(f"{artist} {title} official audio")
+        if not yt: return None
+        return {"url": yt["url"], "title": title, "artist": artist,
+                "duration": duration, "webpage": yt["webpage"],
+                "thumbnail": thumbnail, "source": "spotify"}
+    except Exception as ex:
+        print(f"Spotify search error: {ex}")
+        return await search_youtube(query)
+
+def make_source(url, effect="normal", volume=1.0):
+    ef = EFFECTS.get(effect, "")
+    opts = {"before_options": FFMPEG_BASE, "options": f"-vn -af {ef}" if ef else "-vn"}
+    return discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(url, **opts), volume=volume)
+
+async def play_next(guild, bot, text_channel=None):
+    gid = guild.id
+    queue = music_queues.get(gid, [])
+    if music_loop.get(gid) and music_current.get(gid):
+        queue.insert(0, music_current[gid])
+    if not queue:
+        music_current.pop(gid, None)
+        if text_channel:
+            await text_channel.send(embed=music_embed("Queue finished! Use `!play` to add more songs."))
+        return
+    track = queue.pop(0)
+    music_queues[gid] = queue
+    music_current[gid] = track
+    vc = guild.voice_client
+    if not vc or not vc.is_connected(): return
+    effect = music_effects.get(gid, "normal")
+    vol = music_volume.get(gid, 100) / 100
+    try:
+        source = make_source(track["url"], effect, vol)
+    except Exception as ex:
+        if text_channel: await text_channel.send(f"Failed to play {track['title']}: {ex}")
+        await play_next(guild, bot, text_channel)
+        return
+    def after(error):
+        if error: print(f"Playback error: {error}")
+        asyncio.run_coroutine_threadsafe(play_next(guild, bot, text_channel), bot.loop)
+    vc.play(source, after=after)
+    if text_channel:
+        e = discord.Embed(
+            title="Now Playing",
+            description=f"**[{track['title']}]({track['webpage']})**\n\nArtist: {track['artist']}\nDuration: {format_duration(track['duration'])}\nSource: {track['source'].title()}\nEffect: {effect.title()}",
+            color=0x073590,
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        if track.get("thumbnail"): e.set_thumbnail(url=track["thumbnail"])
+        e.set_footer(text="Ryanair Music System")
+        await text_channel.send(embed=e)
+
+MUSIC_RULES = """
+**Ryanair Music System — Rules**
+
+By accepting these rules you agree to the following:
+
+1. No inappropriate, explicit, or NSFW music.
+2. No songs promoting violence, hate speech, drugs, or self-harm.
+3. Respect other members — no earrape or extremely loud audio.
+4. Do not spam songs or flood the queue.
+5. Staff can remove your music access at any time.
+6. Playing inappropriate content will result in an automatic ban from the music system.
+
+Breaking these rules will result in your music access being removed and the server owner being notified.
+"""
+
+class MusicRulesView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+
+    @discord.ui.button(label="I Accept the Music Rules", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This is not for you.", ephemeral=True); return
+        music_access.add(self.user_id); save_music_data()
+        for item in self.children: item.disabled = True
+        try: await interaction.message.edit(view=self)
+        except: pass
+        await interaction.response.send_message(embed=music_embed(
+            "You now have access to the Ryanair Music System!\n\nJoin a voice channel and use `!play <song>` to get started.\n\nType `!musichelp` to see all commands."
+        ))
+        self.stop()
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.secondary)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This is not for you.", ephemeral=True); return
+        for item in self.children: item.disabled = True
+        try: await interaction.message.edit(view=self)
+        except: pass
+        await interaction.response.send_message("No problem! Type `!acceptmusicrules` again whenever you want access.")
+        self.stop()
+
+async def ban_music_user(user, reason, guild, auto_bot):
+    music_banned.add(user.id); music_access.discard(user.id); save_music_data()
+    try:
+        await user.send(embed=music_embed(
+            f"You have been banned from the Ryanair Music System.\n\n**Reason:** {reason}\n\nContact the server owner if you believe this is an error.",
+            color=0xFF0000
+        ))
+    except: pass
+    owner = guild.owner
+    if owner:
+        try:
+            e = discord.Embed(
+                title="Music System — User Banned",
+                description=f"**User:** {user.display_name} ({user.id})\n**Reason:** {reason}",
+                color=0xFF0000, timestamp=datetime.datetime.now(datetime.timezone.utc)
+            )
+            e.set_footer(text="Ryanair Music System — Automatic Action")
+            owner_obj = await auto_bot.fetch_user(owner.id)
+            await owner_obj.send(embed=e)
+        except: pass
+
+def check_access(ctx):
+    if ctx.author.id in music_banned:
+        return False, "banned"
+    if ctx.author.id not in music_access:
+        return False, "no_access"
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return False, "no_vc"
+    return True, "ok"
+
+"""Register all music ! commands on the bot."""
+
+# ── !acceptmusicrules ─────────────────────────────────────────────────────
+@bot.command(name="acceptmusicrules")
+async def accept_music_rules(ctx):
+    if ctx.author.id in music_banned:
+        await ctx.send(embed=music_embed("You are banned from the music system. Contact the server owner.", color=0xFF0000))
+        return
+    e = discord.Embed(title="Ryanair Music System — Rules", description=MUSIC_RULES, color=0x073590)
+    e.set_footer(text="Ryanair Music System — Please read carefully before accepting")
+    try:
+        view = MusicRulesView(ctx.author.id)
+        await ctx.author.send(embed=e, view=view)
+        await ctx.message.add_reaction("✅")
+    except discord.Forbidden:
+        await ctx.send("Please enable DMs so I can send you the music rules!", delete_after=10)
+
+# ── !play ─────────────────────────────────────────────────────────────────
+@bot.command(name="play", aliases=["p"])
+async def play(ctx, *, query: str):
+    ok, reason = check_access(ctx)
+    if not ok:
+        if reason == "banned":
+            await ctx.send(embed=music_embed("You are banned from the music system.", color=0xFF0000))
+        elif reason == "no_access":
+            await ctx.send(embed=music_embed("You need to accept the music rules first! Type `!acceptmusicrules`"))
+        elif reason == "no_vc":
+            await ctx.send(embed=music_embed("You need to be in a voice channel!"))
+        return
+
+    msg = await ctx.send(embed=music_embed(f"Searching for `{query}`..."))
+
+    # Search
+    if "spotify.com" in query or ("youtube.com" not in query and "youtu.be" not in query and not query.startswith("http")):
+        track = await search_spotify(query)
+    else:
+        track = await search_youtube(query)
+
+    if not track:
+        await msg.edit(embed=music_embed("Could not find that song. Try a different search.", color=0xFF0000))
+        return
+
+    # Content check
+    ok, reason = await is_appropriate(track["title"], track.get("artist",""))
+    if not ok:
+        await msg.edit(embed=music_embed(
+            f"That song has been blocked.\n\n**Reason:** {reason}\n\nYou have been banned from the music system for attempting to play inappropriate content.",
+            color=0xFF0000
+        ))
+        await ban_music_user(ctx.author, f"Attempted to play inappropriate content: {track['title']} — {reason}", ctx.guild, auto_bot)
+        return
+
+    gid = ctx.guild.id
+
+    # Join VC
+    vc = ctx.guild.voice_client
+    user_vc = ctx.author.voice.channel
+    if vc and vc.is_connected():
+        if vc.channel != user_vc: await vc.move_to(user_vc)
+    else:
+        try: vc = await user_vc.connect()
+        except Exception as ex:
+            await msg.edit(embed=music_embed(f"Failed to join voice channel: {ex}", color=0xFF0000)); return
+
+    if gid not in music_queues: music_queues[gid] = []
+
+    if vc.is_playing() or vc.is_paused():
+        music_queues[gid].append(track)
+        await msg.edit(embed=music_embed(
+            f"Added to queue: **{track['title']}** by {track['artist']}\nPosition: #{len(music_queues[gid])}"
+        ))
+    else:
+        music_queues[gid].insert(0, track)
+        await msg.delete()
+        await play_next(ctx.guild, bot, ctx.channel)
+
+# ── !skip ─────────────────────────────────────────────────────────────────
+@bot.command(name="skip", aliases=["s"])
+async def skip(ctx):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access and must be in a VC.")); return
+    vc = ctx.guild.voice_client
+    if not vc or not vc.is_playing():
+        await ctx.send(embed=music_embed("Nothing is playing.")); return
+    vc.stop()
+    await ctx.send(embed=music_embed("Skipped!"))
+
+# ── !stop ─────────────────────────────────────────────────────────────────
+@bot.command(name="stop")
+async def stop(ctx):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access and must be in a VC.")); return
+    gid = ctx.guild.id
+    music_queues[gid] = []; music_current.pop(gid, None)
+    vc = ctx.guild.voice_client
+    if vc: vc.stop(); await vc.disconnect()
+    await ctx.send(embed=music_embed("Stopped and disconnected."))
+
+# ── !pause ────────────────────────────────────────────────────────────────
+@bot.command(name="pause")
+async def pause(ctx):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access and must be in a VC.")); return
+    vc = ctx.guild.voice_client
+    if vc and vc.is_playing(): vc.pause(); await ctx.send(embed=music_embed("Paused."))
+    else: await ctx.send(embed=music_embed("Nothing is playing."))
+
+# ── !resume ───────────────────────────────────────────────────────────────
+@bot.command(name="resume", aliases=["r"])
+async def resume(ctx):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access and must be in a VC.")); return
+    vc = ctx.guild.voice_client
+    if vc and vc.is_paused(): vc.resume(); await ctx.send(embed=music_embed("Resumed."))
+    else: await ctx.send(embed=music_embed("Nothing is paused."))
+
+# ── !nowplaying ───────────────────────────────────────────────────────────
+@bot.command(name="nowplaying", aliases=["np"])
+async def nowplaying(ctx):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access.")); return
+    gid = ctx.guild.id
+    track = music_current.get(gid)
+    if not track: await ctx.send(embed=music_embed("Nothing is playing right now.")); return
+    e = discord.Embed(
+        title="Now Playing",
+        description=f"**[{track['title']}]({track['webpage']})**\n\nArtist: {track['artist']}\nDuration: {format_duration(track['duration'])}\nSource: {track['source'].title()}\nEffect: {music_effects.get(gid,'normal').title()}\nVolume: {music_volume.get(gid,100)}%",
+        color=0x073590
+    )
+    if track.get("thumbnail"): e.set_thumbnail(url=track["thumbnail"])
+    e.set_footer(text="Ryanair Music System")
+    await ctx.send(embed=e)
+
+# ── !queue ────────────────────────────────────────────────────────────────
+@bot.command(name="queue", aliases=["q"])
+async def queue(ctx):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access.")); return
+    gid = ctx.guild.id
+    q = music_queues.get(gid, [])
+    current = music_current.get(gid)
+    if not current and not q: await ctx.send(embed=music_embed("The queue is empty.")); return
+    desc = ""
+    if current: desc += f"**Now Playing:**\n{current['title']} — {current['artist']} ({format_duration(current['duration'])})\n\n"
+    if q:
+        desc += "**Up Next:**\n"
+        for i, t in enumerate(q[:15], 1):
+            desc += f"{i}. {t['title']} — {t['artist']} ({format_duration(t['duration'])})\n"
+        if len(q) > 15: desc += f"\n...and {len(q)-15} more."
+    e = discord.Embed(title=f"Music Queue ({len(q)} songs)", description=desc, color=0x073590)
+    e.set_footer(text="Ryanair Music System")
+    await ctx.send(embed=e)
+
+# ── !volume ───────────────────────────────────────────────────────────────
+@bot.command(name="volume", aliases=["vol"])
+async def volume(ctx, level: int):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access and must be in a VC.")); return
+    level = max(0, min(200, level))
+    gid = ctx.guild.id
+    music_volume[gid] = level
+    vc = ctx.guild.voice_client
+    if vc and vc.source: vc.source.volume = level / 100
+    await ctx.send(embed=music_embed(f"Volume set to **{level}%**."))
+
+# ── !loop ─────────────────────────────────────────────────────────────────
+@bot.command(name="loop", aliases=["l"])
+async def loop(ctx):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access and must be in a VC.")); return
+    gid = ctx.guild.id
+    music_loop[gid] = not music_loop.get(gid, False)
+    await ctx.send(embed=music_embed(f"Loop {'enabled' if music_loop[gid] else 'disabled'}."))
+
+# ── !remove ───────────────────────────────────────────────────────────────
+@bot.command(name="remove")
+async def remove(ctx, position: int):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access.")); return
+    gid = ctx.guild.id
+    q = music_queues.get(gid, [])
+    if position < 1 or position > len(q):
+        await ctx.send(embed=music_embed(f"Invalid position. Queue has {len(q)} songs.")); return
+    removed = q.pop(position - 1); music_queues[gid] = q
+    await ctx.send(embed=music_embed(f"Removed **{removed['title']}** from the queue."))
+
+# ── !clearqueue ───────────────────────────────────────────────────────────
+@bot.command(name="clearqueue", aliases=["cq"])
+async def clearqueue(ctx):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access.")); return
+    music_queues[ctx.guild.id] = []
+    await ctx.send(embed=music_embed("Queue cleared."))
+
+# ── EFFECT COMMANDS ───────────────────────────────────────────────────────
+async def apply_effect(ctx, effect_name):
+    ok, reason = check_access(ctx)
+    if not ok: await ctx.send(embed=music_embed("You need music access and must be in a VC.")); return
+    gid = ctx.guild.id
+    music_effects[gid] = effect_name
+    vc = ctx.guild.voice_client
+    track = music_current.get(gid)
+    if vc and vc.is_playing() and track:
+        vc.stop()
+        vol = music_volume.get(gid, 100) / 100
+        try:
+            source = make_source(track["url"], effect_name, vol)
+            def after(error):
+                asyncio.run_coroutine_threadsafe(play_next(ctx.guild, bot, ctx.channel), bot.loop)
+            vc.play(source, after=after)
+        except Exception as ex:
+            await ctx.send(embed=music_embed(f"Failed to apply effect: {ex}", color=0xFF0000)); return
+    await ctx.send(embed=music_embed(f"Effect set to **{effect_name.title()}**."))
+
+@bot.command(name="3d")
+async def effect_3d(ctx): await apply_effect(ctx, "3d")
+
+@bot.command(name="8d")
+async def effect_8d(ctx): await apply_effect(ctx, "8d")
+
+@bot.command(name="bassboost", aliases=["bb"])
+async def effect_bass(ctx): await apply_effect(ctx, "bassboost")
+
+@bot.command(name="nightcore", aliases=["nc"])
+async def effect_nightcore(ctx): await apply_effect(ctx, "nightcore")
+
+@bot.command(name="slowdown", aliases=["slow"])
+async def effect_slowdown(ctx): await apply_effect(ctx, "slowdown")
+
+@bot.command(name="vaporwave", aliases=["vw"])
+async def effect_vaporwave(ctx): await apply_effect(ctx, "vaporwave")
+
+@bot.command(name="echo")
+async def effect_echo(ctx): await apply_effect(ctx, "echo")
+
+@bot.command(name="karaoke", aliases=["kar"])
+async def effect_karaoke(ctx): await apply_effect(ctx, "karaoke")
+
+@bot.command(name="normaleffect", aliases=["ne", "noeffect"])
+async def effect_normal(ctx): await apply_effect(ctx, "normal")
+
+# ── !musicban / !musicunban ───────────────────────────────────────────────
+@bot.command(name="musicban")
+async def musicban(ctx, member: discord.Member, *, reason: str = "Staff action"):
+    if not any(r.name in ["Senior Staff", "🔒"] for r in ctx.author.roles):
+        await ctx.send(embed=music_embed("Senior Staff+ only.", color=0xFF0000)); return
+    await ban_music_user(member, reason, ctx.guild, auto_bot)
+    await ctx.send(embed=music_embed(f"{member.display_name} has been banned from the music system."))
+
+@bot.command(name="musicunban")
+async def musicunban(ctx, member: discord.Member):
+    if not any(r.name in ["Senior Staff", "🔒"] for r in ctx.author.roles):
+        await ctx.send(embed=music_embed("Senior Staff+ only.", color=0xFF0000)); return
+    music_banned.discard(member.id); save_music_data()
+    try:
+        await member.send(embed=music_embed(
+            "Your music system access has been restored. Type `!acceptmusicrules` to regain access."
+        ))
+    except: pass
+    await ctx.send(embed=music_embed(f"{member.display_name} has been unbanned from the music system."))
+
+# ── !musicstatus ──────────────────────────────────────────────────────────
+@bot.command(name="musicstatus")
+async def musicstatus(ctx):
+    if not any(r.name in ["Senior Staff", "🔒"] for r in ctx.author.roles):
+        await ctx.send(embed=music_embed("Senior Staff+ only.", color=0xFF0000)); return
+    vc = ctx.guild.voice_client; gid = ctx.guild.id
+    e = discord.Embed(title="Music System Status", color=0x073590)
+    e.add_field(name="Users with Access", value=str(len(music_access)), inline=True)
+    e.add_field(name="Users Banned",      value=str(len(music_banned)), inline=True)
+    e.add_field(name="In Voice Channel",  value="Yes" if vc and vc.is_connected() else "No", inline=True)
+    e.add_field(name="Currently Playing", value="Yes" if vc and vc.is_playing() else "No", inline=True)
+    e.add_field(name="Queue Length",      value=str(len(music_queues.get(gid,[]))), inline=True)
+    e.add_field(name="Current Effect",    value=music_effects.get(gid,"normal").title(), inline=True)
+    e.add_field(name="Volume",            value=f"{music_volume.get(gid,100)}%", inline=True)
+    e.add_field(name="Loop",              value="On" if music_loop.get(gid) else "Off", inline=True)
+    e.set_footer(text="Ryanair Music System")
+    await ctx.send(embed=e)
+
+# ── !musichelp ────────────────────────────────────────────────────────────
+@bot.command(name="musichelp", aliases=["mhelp"])
+async def musichelp(ctx):
+    e = discord.Embed(title="Ryanair Music System — Commands", color=0x073590)
+    e.add_field(name="Getting Access", value="`!acceptmusicrules` — Accept the rules to get access", inline=False)
+    e.add_field(name="Playback", value=(
+        "`!play <song>` or `!p` — Play a song from YouTube or Spotify\n"
+        "`!skip` or `!s` — Skip current song\n"
+        "`!stop` — Stop and disconnect\n"
+        "`!pause` — Pause\n"
+        "`!resume` or `!r` — Resume\n"
+        "`!nowplaying` or `!np` — Show current song\n"
+        "`!queue` or `!q` — Show queue\n"
+        "`!volume <0-200>` or `!vol` — Set volume\n"
+        "`!loop` or `!l` — Toggle loop\n"
+        "`!remove <position>` — Remove song from queue\n"
+        "`!clearqueue` or `!cq` — Clear the queue"
+    ), inline=False)
+    e.add_field(name="Audio Effects", value=(
+        "`!3d` — 3D audio\n"
+        "`!8d` — 8D audio\n"
+        "`!bassboost` or `!bb` — Bass boost\n"
+        "`!nightcore` or `!nc` — Nightcore (sped up)\n"
+        "`!slowdown` or `!slow` — Slow down\n"
+        "`!vaporwave` or `!vw` — Vaporwave\n"
+        "`!echo` — Echo effect\n"
+        "`!karaoke` or `!kar` — Karaoke (removes vocals)\n"
+        "`!normaleffect` or `!ne` — Remove all effects"
+    ), inline=False)
+    e.add_field(name="Staff Only", value=(
+        "`!musicban @user <reason>` — Ban from music\n"
+        "`!musicunban @user` — Unban from music\n"
+        "`!musicstatus` — View music system stats"
+    ), inline=False)
+    e.set_footer(text="Ryanair Music System — You must be in a VC to use playback commands")
+    await ctx.send(embed=e)
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def main():
     async with asyncio.TaskGroup() as tg:
