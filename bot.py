@@ -3782,4 +3782,104 @@ async def main():
         if MY_RYANAIR_TOKEN:
             tg.create_task(my_ryanair_bot.start(MY_RYANAIR_TOKEN))
 
+# ── MUSIC SLASH COMMANDS (5) ──────────────────────────────────────────────────
+@tree.command(name="mplay", description="Play a song from YouTube or Spotify (must be in VC)", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(query="Song name, YouTube or Spotify URL")
+async def mplay_cmd(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+    if interaction.user.id in music_banned:
+        await interaction.followup.send(embed=music_embed("You are banned from the music system.", color=0xFF0000)); return
+    if interaction.user.id not in music_access:
+        await interaction.followup.send(embed=music_embed("Type `!acceptmusicrules` first to get music access!")); return
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.followup.send(embed=music_embed("You need to be in a voice channel!")); return
+    msg = await interaction.followup.send(embed=music_embed(f"Searching for `{query}`..."))
+    if "spotify.com" in query or ("youtube.com" not in query and "youtu.be" not in query and not query.startswith("http")):
+        track = await search_spotify(query)
+    else:
+        track = await search_youtube(query)
+    if not track:
+        await msg.edit(embed=music_embed("Could not find that song.", color=0xFF0000)); return
+    ok, reason = await is_appropriate(track["title"], track.get("artist",""))
+    if not ok:
+        await msg.edit(embed=music_embed(f"Song blocked — {reason}", color=0xFF0000))
+        await ban_music_user(interaction.user, f"Inappropriate content: {track['title']}", interaction.guild, auto_bot)
+        return
+    gid = interaction.guild_id
+    vc = interaction.guild.voice_client
+    user_vc = interaction.user.voice.channel
+    if vc and vc.is_connected():
+        if vc.channel != user_vc: await vc.move_to(user_vc)
+    else:
+        try: vc = await user_vc.connect()
+        except Exception as ex:
+            await msg.edit(embed=music_embed(f"Failed to join VC: {ex}", color=0xFF0000)); return
+    if gid not in music_queues: music_queues[gid] = []
+    if vc.is_playing() or vc.is_paused():
+        music_queues[gid].append(track)
+        await msg.edit(embed=music_embed(f"Added to queue: **{track['title']}** by {track['artist']}\nPosition: #{len(music_queues[gid])}"))
+    else:
+        music_queues[gid].insert(0, track)
+        await msg.delete()
+        await play_next(interaction.guild, bot, interaction.channel)
+
+@tree.command(name="mskip", description="Skip the current song", guild=discord.Object(id=GUILD_ID))
+async def mskip_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.user.id not in music_access:
+        await interaction.followup.send("Type `!acceptmusicrules` first.", ephemeral=True); return
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_playing():
+        await interaction.followup.send("Nothing is playing.", ephemeral=True); return
+    vc.stop()
+    await interaction.followup.send(embed=music_embed("Skipped!"), ephemeral=False)
+
+@tree.command(name="mpause", description="Pause or resume the current song", guild=discord.Object(id=GUILD_ID))
+async def mpause_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.user.id not in music_access:
+        await interaction.followup.send("Type `!acceptmusicrules` first.", ephemeral=True); return
+    vc = interaction.guild.voice_client
+    if vc and vc.is_playing():
+        vc.pause()
+        await interaction.followup.send(embed=music_embed("Paused."), ephemeral=False)
+    elif vc and vc.is_paused():
+        vc.resume()
+        await interaction.followup.send(embed=music_embed("Resumed."), ephemeral=False)
+    else:
+        await interaction.followup.send("Nothing is playing.", ephemeral=True)
+
+@tree.command(name="mqueue", description="Show the current music queue", guild=discord.Object(id=GUILD_ID))
+async def mqueue_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.user.id not in music_access:
+        await interaction.followup.send("Type `!acceptmusicrules` first.", ephemeral=True); return
+    gid = interaction.guild_id
+    q = music_queues.get(gid, [])
+    current = music_current.get(gid)
+    if not current and not q:
+        await interaction.followup.send(embed=music_embed("Queue is empty."), ephemeral=True); return
+    desc = ""
+    if current: desc += f"**Now Playing:**\n{current['title']} — {current['artist']} ({format_duration(current['duration'])})\n\n"
+    if q:
+        desc += "**Up Next:**\n"
+        for i, t in enumerate(q[:10], 1):
+            desc += f"{i}. {t['title']} — {t['artist']} ({format_duration(t['duration'])})\n"
+        if len(q) > 10: desc += f"\n...and {len(q)-10} more."
+    e = discord.Embed(title=f"Music Queue ({len(q)} songs)", description=desc, color=0x073590)
+    e.set_footer(text="Ryanair Music System")
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+@tree.command(name="mstop", description="Stop music and disconnect from voice channel", guild=discord.Object(id=GUILD_ID))
+async def mstop_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.user.id not in music_access:
+        await interaction.followup.send("Type `!acceptmusicrules` first.", ephemeral=True); return
+    gid = interaction.guild_id
+    music_queues[gid] = []; music_current.pop(gid, None)
+    vc = interaction.guild.voice_client
+    if vc: vc.stop(); await vc.disconnect()
+    await interaction.followup.send(embed=music_embed("Stopped and disconnected."), ephemeral=False)
+
+
 asyncio.run(main())
