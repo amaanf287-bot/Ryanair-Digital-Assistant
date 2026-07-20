@@ -3473,20 +3473,6 @@ async def ban_from_music(user: discord.Member, reason: str, guild: discord.Guild
         except: pass
 
 # ── /play ─────────────────────────────────────────────────────────────────
-@bot.command(name="acceptmusicrules")
-async def accept_music_rules(ctx):
-    if ctx.author.id in music_banned:
-        await ctx.send(embed=music_embed("You are banned from the music system. Contact the server owner.", color=0xFF0000))
-        return
-    e = discord.Embed(title="Ryanair Music System — Rules", description=MUSIC_RULES, color=0x073590)
-    e.set_footer(text="Ryanair Music System — Please read carefully before accepting")
-    try:
-        view = MusicRulesView(ctx.author.id)
-        await ctx.author.send(embed=e, view=view)
-        await ctx.message.add_reaction("✅")
-    except discord.Forbidden:
-        await ctx.send("Please enable DMs so I can send you the music rules!", delete_after=10)
-
 # ── !play ─────────────────────────────────────────────────────────────────
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query: str):
