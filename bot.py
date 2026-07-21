@@ -3268,17 +3268,23 @@ async def play_next(guild: discord.Guild, bot: commands.Bot, text_channel: disco
     try:
         source = make_audio_source(track["url"], effect, vol)
     except Exception as ex:
+        print(f"[MUSIC ERROR] make_audio_source failed: {ex}")
         if text_channel:
-            await text_channel.send(f"Failed to play {track['title']}: {ex}")
+            await text_channel.send(embed=discord.Embed(description=f"Failed to load audio: `{ex}`", color=0xFF0000).set_footer(text="Ryanair Music System"))
         await play_next(guild, bot, text_channel)
         return
 
     def after_playing(error):
         if error:
-            print(f"Playback error: {error}")
+            print(f"[MUSIC ERROR] Playback error: {error}")
         asyncio.run_coroutine_threadsafe(play_next(guild, bot, text_channel), bot.loop)
 
-    vc.play(source, after=after_playing)
+    try:
+        vc.play(source, after=after_playing)
+    except Exception as ex:
+        print(f"[MUSIC ERROR] vc.play failed: {ex}")
+        if text_channel:
+            await text_channel.send(embed=discord.Embed(description=f"Playback failed: `{ex}`", color=0xFF0000).set_footer(text="Ryanair Music System"))
 
     if text_channel:
         e = discord.Embed(
@@ -3643,7 +3649,7 @@ async def apply_effect(ctx, effect_name):
         vc.stop()
         vol = music_volume.get(gid, 100) / 100
         try:
-            source = make_source(track["url"], effect_name, vol)
+            source = make_audio_source(track["url"], effect_name, vol)
             def after(error):
                 asyncio.run_coroutine_threadsafe(play_next(ctx.guild, bot, ctx.channel), bot.loop)
             vc.play(source, after=after)
