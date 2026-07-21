@@ -3351,6 +3351,29 @@ class MusicRulesView(discord.ui.View):
 # ── SETUP FUNCTION ────────────────────────────────────────────────────────────
 """Call this from your main bot.py to register all music commands."""
 
+# ── BACKGROUND CONTENT CHECK ──────────────────────────────────────────────────
+async def background_content_check(track, guild, user, auto_bot_ref):
+    """Check song content in background while playing. Skip if inappropriate."""
+    ok, reason = await is_appropriate(track["title"], track.get("artist",""))
+    if not ok:
+        gid = guild.id
+        vc = guild.voice_client
+        if music_current.get(gid, {}).get("title") == track["title"]:
+            if vc and vc.is_playing():
+                vc.stop()
+        if gid in music_queues:
+            music_queues[gid] = [t for t in music_queues[gid] if t.get("title") != track["title"]]
+        await ban_music_user(user, f"Played inappropriate content: {track['title']} — {reason}", guild, auto_bot_ref)
+        for channel in guild.text_channels:
+            if channel.permissions_for(guild.me).send_messages:
+                try:
+                    await channel.send(embed=discord.Embed(
+                        description=f"Song stopped: **{track['title']}** was flagged as inappropriate.\n\n**Reason:** {reason}\n\n{user.mention} has been banned from the music system.",
+                        color=0xFF0000
+                    ).set_footer(text="Ryanair Music System"))
+                    break
+                except: pass
+
 # ── !acceptmusicrules ─────────────────────────────────────────────────────
 @bot.command(name="acceptmusicrules")
 async def accept_music_rules(ctx: commands.Context):
@@ -3485,16 +3508,6 @@ async def play(ctx, *, query: str):
         await msg.edit(embed=music_embed("Could not find that song. Try a different search.", color=0xFF0000))
         return
 
-    # Content check
-    ok, reason = await is_appropriate(track["title"], track.get("artist",""))
-    if not ok:
-        await msg.edit(embed=music_embed(
-            f"That song has been blocked.\n\n**Reason:** {reason}\n\nYou have been banned from the music system for attempting to play inappropriate content.",
-            color=0xFF0000
-        ))
-        await ban_music_user(ctx.author, f"Attempted to play inappropriate content: {track['title']} — {reason}", ctx.guild, auto_bot)
-        return
-
     gid = ctx.guild.id
 
     # Join VC
@@ -3508,6 +3521,9 @@ async def play(ctx, *, query: str):
             await msg.edit(embed=music_embed(f"Failed to join voice channel: {ex}", color=0xFF0000)); return
 
     if gid not in music_queues: music_queues[gid] = []
+
+    # Scan in background while playing
+    bot.loop.create_task(background_content_check(track, ctx.guild, ctx.author, auto_bot))
 
     if vc.is_playing() or vc.is_paused():
         music_queues[gid].append(track)
@@ -3787,11 +3803,6 @@ async def mplay_cmd(interaction: discord.Interaction, query: str):
         track = await search_youtube(query)
     if not track:
         await msg.edit(embed=music_embed("Could not find that song.", color=0xFF0000)); return
-    ok, reason = await is_appropriate(track["title"], track.get("artist",""))
-    if not ok:
-        await msg.edit(embed=music_embed(f"Song blocked — {reason}", color=0xFF0000))
-        await ban_music_user(interaction.user, f"Inappropriate content: {track['title']}", interaction.guild, auto_bot)
-        return
     gid = interaction.guild_id
     vc = interaction.guild.voice_client
     user_vc = interaction.user.voice.channel
@@ -3802,6 +3813,8 @@ async def mplay_cmd(interaction: discord.Interaction, query: str):
         except Exception as ex:
             await msg.edit(embed=music_embed(f"Failed to join VC: {ex}", color=0xFF0000)); return
     if gid not in music_queues: music_queues[gid] = []
+    # Scan in background while playing
+    bot.loop.create_task(background_content_check(track, interaction.guild, interaction.user, auto_bot))
     if vc.is_playing() or vc.is_paused():
         music_queues[gid].append(track)
         await msg.edit(embed=music_embed(f"Added to queue: **{track['title']}** by {track['artist']}\nPosition: #{len(music_queues[gid])}"))
