@@ -3875,7 +3875,7 @@ async def shortcut_assign_cmd(interaction: discord.Interaction, mode: str, limit
     ]
     flights.sort(key=lambda item: item[1].get("departure_time_utc", item[1].get("time", "")))
     if not flights:
-        await interaction.response.send_message("No active flights are available. Create one with `/createflight` first.", ephemeral=True)
+        await interaction.response.send_message("No active flights are available. Create one with `/paxflight` or `/createflight` first.", ephemeral=True)
         return
     embed = discord.Embed(
         title="Shortcut Assignment — Select Flight",
@@ -4078,6 +4078,59 @@ async def createflight(
     await interaction.followup.send(response, ephemeral=True)
 
 
+
+
+@tree.command(
+    name="paxflight",
+    description="Create a public passenger flight, Discord event and departures post (Director+)",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(
+    flight_num="Flight number e.g. LS1234",
+    origin="Departing airport e.g. Manchester",
+    destination="Arrival airport e.g. Paphos",
+    airline="Brand e.g. Jet2.com",
+    departure_time="UK departure time e.g. 7:30 PM",
+    report_time="Staff report time in the UK e.g. 6:30 PM",
+    sign_out_time="Staff sign-out time in the UK e.g. 9:30 PM",
+    gate="Departure gate e.g. 12 or TBA",
+    airport_link="Roblox airport/server link",
+    image_url="Required flight banner image URL",
+    attendance_emoji="Emoji passengers react with to confirm attendance",
+)
+async def paxflight_cmd(
+    interaction: discord.Interaction,
+    flight_num: str,
+    origin: str,
+    destination: str,
+    airline: str,
+    departure_time: str,
+    report_time: str,
+    sign_out_time: str,
+    gate: str,
+    airport_link: str,
+    image_url: str,
+    attendance_emoji: str = "✈️",
+):
+    # This runs the exact PAX side of /createflight without requiring
+    # the PAX/STAFF audience dropdown.
+    await createflight.callback(
+        interaction,
+        "pax",
+        flight_num,
+        origin,
+        destination,
+        airline,
+        departure_time,
+        report_time,
+        sign_out_time,
+        gate,
+        airport_link,
+        image_url,
+        attendance_emoji,
+    )
+
+
 @tree.command(name="flight", description="Announce a flight to all online Jet2.rblx Staff Team members (Owner only)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(flight_num="Flight number e.g. LS1234", destination="Route e.g. Manchester to Paphos", airline="Brand e.g. Jet2.com", departure_time="Departure time UK e.g. 2:30 PM", report_time="Report to airport by UK time e.g. 1:00 PM", airport_link="Link to game airport", image_url="Optional flight banner image URL")
 async def flight_cmd(interaction: discord.Interaction, flight_num: str, destination: str, airline: str, departure_time: str, report_time: str, airport_link: str = None, image_url: str = None):
@@ -4117,7 +4170,7 @@ async def flight_cmd(interaction: discord.Interaction, flight_num: str, destinat
     await interaction.followup.send(f"Flight announcement sent to {sent} online staff members.\n**Flight ID:** `{flight_id}`", ephemeral=True)
 
 @tree.command(name="attended", description="View who responded to a flight announcement (Owner only)", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(flight_id="The flight ID from /flight or /createflight")
+@app_commands.describe(flight_id="The flight ID from /flight, /paxflight or /createflight")
 async def attended_cmd(interaction: discord.Interaction, flight_id: str):
     await interaction.response.defer(ephemeral=True)
     if not is_lock(interaction.user): await interaction.followup.send("Owner only.", ephemeral=True); return
@@ -4164,7 +4217,7 @@ async def assign_cmd(interaction: discord.Interaction, member: discord.Member, s
     today = now().strftime("%Y-%m-%d")
     todays_flights = [(fid, f) for fid, f in active_flights.items() if f.get("date") == today]
     if not todays_flights:
-        await interaction.followup.send("No flights created today. Use `/createflight` to create one first.", ephemeral=True); return
+        await interaction.followup.send("No flights created today. Use `/paxflight` or `/createflight` to create one first.", ephemeral=True); return
 
     async def do_assign(fid, flight):
         rt  = report_time   or flight.get("report_time", "N/A")
@@ -4873,7 +4926,7 @@ async def update_cmd(interaction: discord.Interaction):
     e = discord.Embed(title="Jet2.rblx Digital Assistant — Features & Commands", color=JET2_RED, timestamp=now())
     e.add_field(name="🎫 Ticket System", value="`/connected` `/unconnected` `/close` `/closeall` `/forceopen` `/onhold` `/ticketrename` `/ticketnote` `/tickettransfer` `/ticketpriority` `/ticketban` `/ticketunban` `/ticketstats` `/ticketsummary` `/requeststaff` `/anonreply` `/aideal` `/supporttickets` `/snippet` `/snippetadd` `/snippetlist` `/snippetdelete` `/careers` `/say` `/pingstaff` `/ticketchannel`", inline=False)
     e.add_field(name="🛡️ Moderation", value="`/warn` `/warnings` `/clearwarnings` `/timeout` `/untimeout` `/kick` `/ban` `/unban` `/softban` `/purge` `/slowmode` `/nick` `/usernick` `/role` `/roleemoji` `/massrole` `/lockdown` `/unlockdown` `/strike` `/clearstrikes` `/fire` `/modunlock` `/note` `/viewnotes` `/modhistory` `/logs` `/warndm` `/dm` `/allow` `/blacklist` `/unblacklist` `/viewblacklist`", inline=False)
-    e.add_field(name="✈️ Flight System", value="`/createflight` `/shortcut assign` `/flightupdate` `/flightended` `/attended` `/assign` `/reassign` `/report` `/assigned` `/flightcancel`", inline=False)
+    e.add_field(name="✈️ Flight System", value="`/paxflight` `/createflight` `/shortcut assign` `/flightupdate` `/flightended` `/attended` `/assign` `/reassign` `/report` `/assigned` `/flightcancel`", inline=False)
     e.add_field(name="📢 Announcements", value="`/announce` `/announcechannel` `/channelembed` `/notifydm` `/announcedm` `/embed`\nAll use popup modals — formatting is preserved exactly as you type it.", inline=False)
     e.add_field(name="🤖 AI System", value="`/ai` `/aiask` `/aistatus` `/ai_toggle` `/ai_ticket_toggle` `/ai_preset_add` `/ai_preset_remove` `/aideal` `/ticketsummary`", inline=False)
     e.add_field(name="⚙️ Config & Utility", value="`/config` `/roleupdate` `/welcome enable/disable` `/readonly` `/ticketchannel` `/allow` `/resetraids`\n`/membercount` `/serverinfo` `/botstatus` `/stafflist` `/onlinestaff` `/userinfo` `/staffinfo` `/viewtickets` `/remind`\n`/commands` `/update`", inline=False)
@@ -4912,7 +4965,7 @@ async def commands_cmd(interaction: discord.Interaction, category: str = "all"):
 
     if category in ("flight","all") and level >= 4:
         e = discord.Embed(title="✈️ Flight Commands", color=JET2_RED)
-        e.add_field(name="Directors / Executives (Level 4+)", value="`/createflight` — Create a flight (DMs owner the Flight ID)\n`/assign` — Assign staff to a flight (shows today's flights as dropdown)", inline=False)
+        e.add_field(name="Directors / Executives (Level 4+)", value="`/paxflight` — Create a public passenger flight, event and departures post\n`/createflight` — Create a PAX or STAFF flight (DMs owner the Flight ID)\n`/assign` — Assign staff to a flight (shows today's flights as dropdown)", inline=False)
         if level >= 5:
             e.add_field(name="Owner Only", value=("`/flight` — Announce flight to all online staff\n`/attended` — View who responded\n`/reassign` — Reassign a declined slot\n`/report` — Send join now to assigned staff\n`/assigned` — View all assignments\n`/flightcancel` — Cancel a flight\n`/flightupdate` — Update flight details"), inline=False)
         embeds.append(e)
