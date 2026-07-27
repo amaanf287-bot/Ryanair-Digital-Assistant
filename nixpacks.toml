@@ -1,4 +1,7 @@
+# Jet2.rblx Discord bot — Railway/Nixpacks configuration
+
 [phases.setup]
-nixPkgs = ["ffmpeg", "ffmpeg-full"]
-[phases.install]
-cmds = ["pip install -r requirements.txt"]
+nixPkgs = ["...", "ffmpeg", "deno"]
+
+[start]
+cmd = "python bot.py"
