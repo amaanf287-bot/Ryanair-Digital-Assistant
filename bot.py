@@ -1,10 +1,16 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import json, os, datetime, asyncio, re, uuid
+import json, os, datetime, asyncio, re, uuid, shutil
+from collections import deque
 from groq import Groq
 from dotenv import load_dotenv
 import pytz
+
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
 
 load_dotenv()
 
@@ -110,6 +116,29 @@ staff_tickets_claimed = {}; pending_mod_actions = {}; mod_strike_count = {}
 flight_responses = {}; active_flights = {}; assignments = {}
 allow_permissions = {}; level_config = {}; raid_timestamps = {}
 owner_ai_sessions = {}; blacklist = set(); role_slot_counts = {}
+
+# ── MUSIC SYSTEM ──────────────────────────────────────────────────────────────
+# Members must accept the rules with !acceptmusicrules before using /play.
+MUSIC_MAX_DURATION_SECONDS = max(60, int(os.getenv("MUSIC_MAX_DURATION_SECONDS", "1200")))
+MUSIC_MAX_QUEUE_LENGTH = max(1, int(os.getenv("MUSIC_MAX_QUEUE_LENGTH", "20")))
+MUSIC_IDLE_TIMEOUT_SECONDS = max(30, int(os.getenv("MUSIC_IDLE_TIMEOUT_SECONDS", "180")))
+MUSIC_VOLUME = min(1.0, max(0.05, float(os.getenv("MUSIC_VOLUME", "0.45"))))
+YTDLP_COOKIE_FILE = os.getenv("YTDLP_COOKIE_FILE", "").strip()
+
+MUSIC_RULES_TEXT = (
+    "1. Only play music that is suitable for the server.\n"
+    "2. Do not play explicit, hateful, discriminatory, sexual, violent or deliberately disruptive audio.\n"
+    "3. Do not spam the queue or repeatedly interrupt other listeners.\n"
+    "4. You must remain in the same voice channel as the bot while using music commands.\n"
+    "5. Staff may skip or stop music when necessary. Misuse can result in music access being removed."
+)
+
+music_rules_accepted = set()
+music_queues = {}
+music_current = {}
+music_locks = {}
+music_starting = set()
+music_idle_tasks = {}
 
 # ── JET2.RBLX ROLE MODEL ──────────────────────────────────────────────────────
 # The bot uses these names as permission levels even before /config is run.
@@ -371,6 +400,7 @@ def load_data():
     global welcome_config, staff_tickets_claimed, mod_strike_count
     global flight_responses, active_flights, assignments, allow_permissions
     global level_config, blacklist, role_slot_counts, ai_ticket_enabled
+    global music_rules_accepted
     if os.path.exists("data.json"):
         with open("data.json", "r") as f:
             d = json.load(f)
@@ -401,6 +431,7 @@ def load_data():
             blacklist             = set(int(x) for x in d.get("blacklist", []))
             role_slot_counts      = d.get("role_slot_counts", {})
             ai_ticket_enabled     = d.get("ai_ticket_enabled", True)
+            music_rules_accepted  = set(int(x) for x in d.get("music_rules_accepted", []))
 
 def save_data():
     with open("data.json", "w") as f:
@@ -432,6 +463,7 @@ def save_data():
             "blacklist":             list(blacklist),
             "role_slot_counts":      role_slot_counts,
             "ai_ticket_enabled":     ai_ticket_enabled,
+            "music_rules_accepted":  sorted(music_rules_accepted),
         }, f, indent=2)
 
 def get_user_level(member):
@@ -1693,7 +1725,7 @@ async def on_message(message):
                             await message.channel.send(embed=plain_embed(f"{message.author.mention} Automatic warning issued for repeatedly pinging staff in tickets. (Warning #{warnings[message.author.id]})"))
                             log_mod(message.author.id, "Auto-Warning (Staff Ping)", "System", "Repeated staff ping in ticket")
                         break
-            if member and is_support_staff(member) and not message.content.startswith("/"):
+            if member and is_support_staff(member) and not message.content.startswith(("/", "!")):
                 ticket_ai_active[cid] = False
                 if user_id and user:
                     last_activity[cid] = now()
@@ -3645,6 +3677,397 @@ async def welcome_cmd(interaction: discord.Interaction, enabled: bool, channel: 
 
 
 # ── UTILITY ───────────────────────────────────────────────────────────────────
+# ── MUSIC HELPERS & COMMANDS ──────────────────────────────────────────────────
+def get_music_queue(guild_id):
+    return music_queues.setdefault(guild_id, deque())
+
+
+def get_music_lock(guild_id):
+    lock = music_locks.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        music_locks[guild_id] = lock
+    return lock
+
+
+def format_music_duration(seconds):
+    if not seconds:
+        return "Unknown"
+    seconds = int(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def music_dependencies_error():
+    if yt_dlp is None:
+        return "`yt-dlp` is not installed. Add `yt-dlp[default,curl-cffi]` to your requirements file."
+    if not shutil.which("ffmpeg"):
+        return "FFmpeg is not installed or is not available on PATH."
+    return None
+
+
+def ytdlp_options():
+    options = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "source_address": "0.0.0.0",
+        "socket_timeout": 20,
+        "retries": 3,
+        "fragment_retries": 3,
+    }
+    if YTDLP_COOKIE_FILE:
+        options["cookiefile"] = YTDLP_COOKIE_FILE
+    return options
+
+
+async def search_music_track(search_text):
+    def extract():
+        target = search_text.strip()
+        if not re.match(r"^https?://", target, flags=re.IGNORECASE):
+            target = f"ytsearch1:{target}"
+        with yt_dlp.YoutubeDL(ytdlp_options()) as ydl:
+            result = ydl.extract_info(target, download=False)
+            if result and result.get("entries"):
+                result = next((entry for entry in result["entries"] if entry), None)
+            if not result:
+                raise RuntimeError("No matching track was found.")
+            return {
+                "title": result.get("title") or "Unknown title",
+                "webpage_url": result.get("webpage_url") or result.get("original_url") or result.get("url"),
+                "duration": result.get("duration"),
+                "thumbnail": result.get("thumbnail"),
+                "uploader": result.get("uploader") or result.get("channel") or "Unknown artist/channel",
+                "is_live": bool(result.get("is_live") or result.get("live_status") == "is_live"),
+            }
+
+    return await asyncio.to_thread(extract)
+
+
+async def resolve_music_stream(webpage_url):
+    def extract():
+        with yt_dlp.YoutubeDL(ytdlp_options()) as ydl:
+            result = ydl.extract_info(webpage_url, download=False)
+            if result and result.get("entries"):
+                result = next((entry for entry in result["entries"] if entry), None)
+            if not result or not result.get("url"):
+                raise RuntimeError("No playable audio stream was returned.")
+            return result["url"]
+
+    return await asyncio.to_thread(extract)
+
+
+def cancel_music_idle_task(guild_id):
+    task = music_idle_tasks.pop(guild_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def music_idle_disconnect(guild_id):
+    try:
+        await asyncio.sleep(MUSIC_IDLE_TIMEOUT_SECONDS)
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            return
+        voice_client = guild.voice_client
+        if (
+            voice_client
+            and voice_client.is_connected()
+            and not voice_client.is_playing()
+            and not voice_client.is_paused()
+            and not get_music_queue(guild_id)
+            and guild_id not in music_current
+        ):
+            await voice_client.disconnect(force=True)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        music_idle_tasks.pop(guild_id, None)
+
+
+def schedule_music_idle_disconnect(guild_id):
+    cancel_music_idle_task(guild_id)
+    music_idle_tasks[guild_id] = asyncio.create_task(music_idle_disconnect(guild_id))
+
+
+async def music_track_finished(guild_id, error=None):
+    guild = bot.get_guild(guild_id)
+    track = music_current.pop(guild_id, None)
+    if error and guild and track:
+        channel = guild.get_channel(track.get("text_channel_id"))
+        if channel:
+            try:
+                await channel.send(f"Music playback error: `{error}`")
+            except discord.HTTPException:
+                pass
+    if guild:
+        await start_next_music_track(guild)
+
+
+async def start_next_music_track(guild):
+    guild_id = guild.id
+    lock = get_music_lock(guild_id)
+
+    async with lock:
+        voice_client = guild.voice_client
+        if not voice_client or not voice_client.is_connected():
+            music_current.pop(guild_id, None)
+            get_music_queue(guild_id).clear()
+            music_starting.discard(guild_id)
+            return
+        if voice_client.is_playing() or voice_client.is_paused() or guild_id in music_starting:
+            return
+
+        queue = get_music_queue(guild_id)
+        if not queue:
+            music_current.pop(guild_id, None)
+            schedule_music_idle_disconnect(guild_id)
+            return
+
+        cancel_music_idle_task(guild_id)
+        track = queue.popleft()
+        music_current[guild_id] = track
+        music_starting.add(guild_id)
+
+    channel = guild.get_channel(track.get("text_channel_id"))
+    try:
+        stream_url = await resolve_music_stream(track["webpage_url"])
+        voice_client = guild.voice_client
+
+        async with lock:
+            if (
+                music_current.get(guild_id) is not track
+                or not voice_client
+                or not voice_client.is_connected()
+            ):
+                music_starting.discard(guild_id)
+                return
+
+            source = discord.PCMVolumeTransformer(
+                discord.FFmpegPCMAudio(
+                    stream_url,
+                    before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                    options="-vn -loglevel warning",
+                ),
+                volume=MUSIC_VOLUME,
+            )
+
+            def after_playback(playback_error):
+                asyncio.run_coroutine_threadsafe(
+                    music_track_finished(guild_id, playback_error),
+                    bot.loop,
+                )
+
+            voice_client.play(source, after=after_playback)
+            music_starting.discard(guild_id)
+
+        if channel:
+            embed = discord.Embed(
+                title="Now Playing",
+                description=f"[{track['title']}]({track['webpage_url']})",
+                color=JET2_RED,
+                timestamp=now(),
+            )
+            embed.add_field(name="Artist / Channel", value=track["uploader"], inline=True)
+            embed.add_field(name="Duration", value=format_music_duration(track.get("duration")), inline=True)
+            embed.add_field(name="Requested by", value=f"<@{track['requester_id']}>", inline=True)
+            if track.get("thumbnail"):
+                embed.set_thumbnail(url=track["thumbnail"])
+            embed.set_footer(text="Jet2.rblx Music | /skip to skip")
+            await channel.send(embed=embed)
+
+    except Exception as ex:
+        async with lock:
+            music_starting.discard(guild_id)
+            if music_current.get(guild_id) is track:
+                music_current.pop(guild_id, None)
+        if channel:
+            await channel.send(f"I could not play **{track['title']}**: `{str(ex)[:300]}`")
+        await start_next_music_track(guild)
+
+
+def member_in_bot_voice_channel(member, voice_client):
+    return bool(
+        member
+        and member.voice
+        and member.voice.channel
+        and voice_client
+        and voice_client.channel
+        and member.voice.channel.id == voice_client.channel.id
+    )
+
+
+@bot.command(name="acceptmusicrules")
+async def accept_music_rules_cmd(ctx):
+    if not ctx.guild:
+        await ctx.send("Use this command inside the Jet2.rblx server.")
+        return
+
+    already_accepted = ctx.author.id in music_rules_accepted
+    music_rules_accepted.add(ctx.author.id)
+    save_data()
+
+    embed = discord.Embed(
+        title="Jet2.rblx Music Rules",
+        description=MUSIC_RULES_TEXT,
+        color=JET2_RED,
+    )
+    if already_accepted:
+        embed.add_field(name="Status", value="You had already accepted these rules.", inline=False)
+    else:
+        embed.add_field(name="Status", value="Accepted. You can now join a voice channel and use `/play`.", inline=False)
+    embed.set_footer(text="Your acceptance is saved until an owner removes it from the bot data.")
+    await ctx.send(embed=embed)
+
+
+@tree.command(name="play", description="Search for and play music in your voice channel", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(search="Song name, artist or supported video URL")
+async def play_music_cmd(interaction: discord.Interaction, search: str):
+    await interaction.response.defer()
+
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send("This command can only be used in the server.", ephemeral=True)
+        return
+    if interaction.user.id not in music_rules_accepted:
+        await interaction.followup.send(
+            "You must accept the music rules first. Type `!acceptmusicrules` in a server text channel, then use `/play` again.",
+            ephemeral=True,
+        )
+        return
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.followup.send("Join a voice channel before using `/play`.", ephemeral=True)
+        return
+
+    dependency_error = music_dependencies_error()
+    if dependency_error:
+        await interaction.followup.send(dependency_error, ephemeral=True)
+        return
+
+    guild = interaction.guild
+    requested_channel = interaction.user.voice.channel
+    voice_client = guild.voice_client
+
+    if voice_client and voice_client.is_connected() and voice_client.channel.id != requested_channel.id:
+        await interaction.followup.send(
+            f"I am already playing music in {voice_client.channel.mention}. Join that voice channel to add songs.",
+            ephemeral=True,
+        )
+        return
+
+    if not voice_client or not voice_client.is_connected():
+        try:
+            voice_client = await requested_channel.connect(self_deaf=True)
+        except Exception as ex:
+            await interaction.followup.send(
+                f"I could not join your voice channel. Check Connect/Speak permissions and PyNaCl. Error: `{str(ex)[:250]}`",
+                ephemeral=True,
+            )
+            return
+
+    queue = get_music_queue(guild.id)
+    if len(queue) >= MUSIC_MAX_QUEUE_LENGTH:
+        await interaction.followup.send(
+            f"The music queue is full ({MUSIC_MAX_QUEUE_LENGTH} waiting tracks).",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        track = await search_music_track(search)
+    except Exception as ex:
+        await interaction.followup.send(f"I could not find that track: `{str(ex)[:300]}`", ephemeral=True)
+        return
+
+    if track.get("is_live"):
+        await interaction.followup.send("Live streams are not allowed in the music system.", ephemeral=True)
+        return
+    duration = track.get("duration")
+    if duration and duration > MUSIC_MAX_DURATION_SECONDS:
+        await interaction.followup.send(
+            f"That track is too long. The limit is {format_music_duration(MUSIC_MAX_DURATION_SECONDS)}.",
+            ephemeral=True,
+        )
+        return
+
+    track.update({
+        "requester_id": interaction.user.id,
+        "requester_name": interaction.user.display_name,
+        "text_channel_id": interaction.channel_id,
+    })
+    queue.append(track)
+    queue_position = len(queue)
+
+    await interaction.followup.send(
+        f"Added **{track['title']}** to the music queue. Queue position: **{queue_position}**."
+    )
+    await start_next_music_track(guild)
+
+
+@tree.command(name="skip", description="Skip the current music track", guild=discord.Object(id=GUILD_ID))
+async def skip_music_cmd(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("This command can only be used in the server.", ephemeral=True)
+        return
+
+    voice_client = interaction.guild.voice_client
+    track = music_current.get(interaction.guild.id)
+    if not voice_client or not voice_client.is_connected() or not track:
+        await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
+        return
+    if not member_in_bot_voice_channel(interaction.user, voice_client):
+        await interaction.response.send_message("Join my voice channel before using `/skip`.", ephemeral=True)
+        return
+
+    can_skip = (
+        interaction.user.id == track.get("requester_id")
+        or is_support_staff(interaction.user)
+        or is_server_owner(interaction.user)
+    )
+    if not can_skip:
+        await interaction.response.send_message(
+            "Only the person who requested this track or Level 3+ staff can skip it.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(f"Skipped **{track['title']}**.")
+    voice_client.stop()
+
+
+@tree.command(name="stopmusic", description="Stop music, clear the queue and disconnect the bot", guild=discord.Object(id=GUILD_ID))
+async def stop_music_cmd(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("This command can only be used in the server.", ephemeral=True)
+        return
+    if not is_support_staff(interaction.user) and not is_server_owner(interaction.user):
+        await interaction.response.send_message("Level 3+ staff only.", ephemeral=True)
+        return
+
+    voice_client = interaction.guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        await interaction.response.send_message("I am not connected to a voice channel.", ephemeral=True)
+        return
+    if not is_server_owner(interaction.user) and not member_in_bot_voice_channel(interaction.user, voice_client):
+        await interaction.response.send_message("Join my voice channel before stopping the music.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    cancel_music_idle_task(guild_id)
+    get_music_queue(guild_id).clear()
+    music_current.pop(guild_id, None)
+    music_starting.discard(guild_id)
+
+    if voice_client.is_playing() or voice_client.is_paused():
+        voice_client.stop()
+    await voice_client.disconnect(force=True)
+    await interaction.response.send_message("Music stopped, the queue was cleared and I disconnected.")
+
+
 @tree.command(name="membercount", description="View the current server member count", guild=discord.Object(id=GUILD_ID))
 async def membercount(interaction: discord.Interaction):
     guild = bot.get_guild(GUILD_ID)
@@ -3792,6 +4215,7 @@ async def update_cmd(interaction: discord.Interaction):
     e.add_field(name="✈️ Flight System", value="`/createflight` `/flight` `/attended` `/assign` `/reassign` `/report` `/assigned` `/flightcancel` `/flightupdate`", inline=False)
     e.add_field(name="📢 Announcements", value="`/announce` `/announcechannel` `/channelembed` `/notifydm` `/announcedm` `/embed`\nAll use popup modals — formatting is preserved exactly as you type it.", inline=False)
     e.add_field(name="🤖 AI System", value="`/ai` `/aiask` `/aistatus` `/ai_toggle` `/ai_ticket_toggle` `/ai_preset_add` `/ai_preset_remove` `/aideal` `/ticketsummary`", inline=False)
+    e.add_field(name="🎵 Music System", value="Type `!acceptmusicrules` once, join a voice channel, then use `/play`. Use `/skip` to skip your own request; Level 3+ staff can use `/stopmusic` to clear the queue and disconnect the bot.", inline=False)
     e.add_field(name="⚙️ Config & Utility", value="`/config` `/roleupdate` `/welcome enable/disable` `/readonly` `/ticketchannel` `/allow` `/resetraids`\n`/membercount` `/serverinfo` `/botstatus` `/stafflist` `/onlinestaff` `/userinfo` `/staffinfo` `/viewtickets` `/remind`\n`/commands` `/update`", inline=False)
     e.set_footer(text="Jet2.rblx Digital Assistant — Full Feature List")
     await interaction.followup.send(embed=e, ephemeral=True)
@@ -3804,6 +4228,7 @@ async def update_cmd(interaction: discord.Interaction):
     app_commands.Choice(name="Flight",        value="flight"),
     app_commands.Choice(name="Announcements", value="announcements"),
     app_commands.Choice(name="AI",            value="ai"),
+    app_commands.Choice(name="Music",         value="music"),
     app_commands.Choice(name="General",       value="general"),
     app_commands.Choice(name="All",           value="all"),
 ])
@@ -3844,6 +4269,13 @@ async def commands_cmd(interaction: discord.Interaction, category: str = "all"):
         e.add_field(name="Level 2+", value="`/ai` — Start private AI session in DMs\n`/aiask` — Quick AI question", inline=False)
         if level >= 4: e.add_field(name="Level 4+", value="`/ticketsummary` — AI summary of current ticket\n`/aideal` — Hand ticket fully to AI\n`/aistatus` — Check AI status", inline=False)
         if level >= 5: e.add_field(name="Owner Only", value="`/ai_toggle` `/ai_ticket_toggle` `/ai_preset_add` `/ai_preset_remove`\nDM the bot directly to use AI to announce or message staff", inline=False)
+        embeds.append(e)
+
+    if category in ("music","all"):
+        e = discord.Embed(title="🎵 Music Commands", color=JET2_RED)
+        e.add_field(name="Everyone who accepts the rules", value="`!acceptmusicrules` — Accept the rules once\n`/play` — Search for and play a track\n`/skip` — Skip a track you requested", inline=False)
+        if level >= 3:
+            e.add_field(name="Level 3+", value="`/stopmusic` — Stop playback, clear the queue and disconnect the bot", inline=False)
         embeds.append(e)
 
     if category in ("general","all"):
