@@ -3896,8 +3896,10 @@ async def shortcut_assign_cmd(interaction: discord.Interaction, mode: str, limit
 tree.add_command(shortcut_group, guild=discord.Object(id=GUILD_ID))
 
 
-@tree.command(name="createflight", description="Create a public flight, Discord event and departures post (Director+)", guild=discord.Object(id=GUILD_ID))
+
+@tree.command(name="createflight", description="Create a passenger or staff flight (Director+)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
+    audience="Choose whether this is a passenger-facing flight or a staff-only flight",
     flight_num="Flight number e.g. LS1234",
     origin="Departing airport e.g. Manchester",
     destination="Arrival airport e.g. Paphos",
@@ -3907,11 +3909,16 @@ tree.add_command(shortcut_group, guild=discord.Object(id=GUILD_ID))
     sign_out_time="Staff sign-out time in the UK e.g. 9:30 PM",
     gate="Departure gate e.g. 12 or TBA",
     airport_link="Roblox airport/server link",
-    image_url="Required public flight banner image URL",
-    attendance_emoji="Emoji passengers react with to confirm attendance",
+    image_url="Required flight banner image URL",
+    attendance_emoji="Emoji passengers react with to confirm attendance on PAX flights",
 )
+@app_commands.choices(audience=[
+    app_commands.Choice(name="PAX — Passenger Flight", value="pax"),
+    app_commands.Choice(name="STAFF — Staff-Only Flight", value="staff"),
+])
 async def createflight(
     interaction: discord.Interaction,
+    audience: str,
     flight_num: str,
     origin: str,
     destination: str,
@@ -3927,6 +3934,9 @@ async def createflight(
     await interaction.response.defer(ephemeral=True)
     if not is_senior(interaction.user):
         await interaction.followup.send("Director+ only.", ephemeral=True)
+        return
+    if audience not in {"pax", "staff"}:
+        await interaction.followup.send("Please choose either PAX or STAFF.", ephemeral=True)
         return
     if not image_url.startswith(("http://", "https://")):
         await interaction.followup.send("A valid `http://` or `https://` banner image URL is required.", ephemeral=True)
@@ -3949,6 +3959,7 @@ async def createflight(
         "destination_name": destination,
         "destination": route,
         "airline": airline,
+        "audience": audience,
         "departure_time": departure_time,
         "departure_time_utc": departure_dt.isoformat(),
         "report_time": report_time,
@@ -3966,71 +3977,81 @@ async def createflight(
 
     guild = interaction.guild
     warnings_list = []
+    departures = None
 
-    # Create an external Discord scheduled event with the supplied banner.
-    image_bytes = await download_image_bytes(image_url)
-    try:
-        event = await guild.create_scheduled_event(
-            name=f"{flight_num} | {route}"[:100],
-            description=(
-                f"Jet2.rblx flight {flight_num}\n"
-                f"Route: {route}\n"
-                f"Gate: {gate}\n"
-                f"Open the airport: {airport_link}"
-            )[:1000],
-            start_time=departure_dt,
-            end_time=departure_dt + datetime.timedelta(minutes=FLIGHT_EVENT_DURATION_MINUTES),
-            entity_type=discord.EntityType.external,
-            privacy_level=discord.PrivacyLevel.guild_only,
-            location=f"Jet2.rblx | {route}"[:100],
-            image=image_bytes,
-            reason=f"Flight created by {interaction.user}",
-        )
-        flight["scheduled_event_id"] = str(event.id)
-        flight["scheduled_event_url"] = event.url
-    except (discord.Forbidden, discord.HTTPException, TypeError, ValueError) as ex:
-        warnings_list.append(f"Discord event could not be created: {ex}")
+    # PAX flights are public: create a Discord event and departures announcement.
+    if audience == "pax":
+        image_bytes = await download_image_bytes(image_url)
+        try:
+            event = await guild.create_scheduled_event(
+                name=f"{flight_num} | {route}"[:100],
+                description=(
+                    f"Jet2.rblx passenger flight {flight_num}\n"
+                    f"Route: {route}\n"
+                    f"Gate: {gate}\n"
+                    f"Open the airport: {airport_link}"
+                )[:1000],
+                start_time=departure_dt,
+                end_time=departure_dt + datetime.timedelta(minutes=FLIGHT_EVENT_DURATION_MINUTES),
+                entity_type=discord.EntityType.external,
+                privacy_level=discord.PrivacyLevel.guild_only,
+                location=f"Jet2.rblx | {route}"[:100],
+                image=image_bytes,
+                reason=f"PAX flight created by {interaction.user}",
+            )
+            flight["scheduled_event_id"] = str(event.id)
+            flight["scheduled_event_url"] = event.url
+        except (discord.Forbidden, discord.HTTPException, TypeError, ValueError) as ex:
+            warnings_list.append(f"Discord event could not be created: {ex}")
 
     active_flights[flight_id] = flight
     flight_responses[flight_id] = {}
     save_data()
 
-    departures = get_departures_channel(guild)
-    if departures:
-        try:
-            message = await departures.send(
-                embed=build_departures_embed(flight_id, flight),
-                view=FlightLinkView(airport_link, flight.get("scheduled_event_url")),
-            )
+    if audience == "pax":
+        departures = get_departures_channel(guild)
+        if departures:
             try:
-                await message.add_reaction(flight["attendance_emoji"])
-            except (discord.HTTPException, discord.NotFound):
-                flight["attendance_emoji"] = "✈️"
+                message = await departures.send(
+                    embed=build_departures_embed(flight_id, flight),
+                    view=FlightLinkView(airport_link, flight.get("scheduled_event_url")),
+                )
                 try:
-                    await message.add_reaction("✈️")
-                except discord.HTTPException:
-                    pass
-                warnings_list.append("The supplied reaction emoji was invalid, so ✈️ was used.")
-            flight["departures_channel_id"] = str(departures.id)
-            flight["departures_message_id"] = str(message.id)
-            active_flights[flight_id] = flight
-            save_data()
-        except (discord.Forbidden, discord.HTTPException) as ex:
-            warnings_list.append(f"Departures announcement failed: {ex}")
-    else:
-        warnings_list.append("The departures channel could not be found. Set DEPARTURES_CHANNEL_ID in Railway.")
+                    await message.add_reaction(flight["attendance_emoji"])
+                except (discord.HTTPException, discord.NotFound):
+                    flight["attendance_emoji"] = "✈️"
+                    try:
+                        await message.add_reaction("✈️")
+                    except discord.HTTPException:
+                        pass
+                    warnings_list.append("The supplied reaction emoji was invalid, so ✈️ was used.")
+                flight["departures_channel_id"] = str(departures.id)
+                flight["departures_message_id"] = str(message.id)
+                active_flights[flight_id] = flight
+                save_data()
+            except (discord.Forbidden, discord.HTTPException) as ex:
+                warnings_list.append(f"Departures announcement failed: {ex}")
+        else:
+            warnings_list.append("The departures channel could not be found. Set DEPARTURES_CHANNEL_ID in Railway.")
 
     # Send the owner a management copy containing the Flight ID.
     if guild.owner:
         try:
+            audience_label = "PAX — Passenger Flight" if audience == "pax" else "STAFF — Staff-Only Flight"
+            reaction_line = (
+                f"**Reaction:** {flight['attendance_emoji']}"
+                if audience == "pax"
+                else "**Public event:** No"
+            )
             owner_embed = discord.Embed(
                 title=f"Flight Created — {flight_num}",
                 description=(
                     f"**Flight ID:** `{flight_id}`\n"
+                    f"**Audience:** {audience_label}\n"
                     f"**Route:** {route}\n"
                     f"**Departure:** {departure_time} UK\n"
                     f"**Gate:** {gate}\n"
-                    f"**Reaction:** {flight['attendance_emoji']}\n\n"
+                    f"{reaction_line}\n\n"
                     "Use `/shortcut assign` for role-pool or multi-user assignments.\n"
                     "Use `/flightupdate` for check-in, server, boarding, delay, cancellation and landing updates."
                 ),
@@ -4042,9 +4063,16 @@ async def createflight(
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    response = f"Flight **{flight_num}** created. Flight ID: `{flight_id}`."
-    if departures:
-        response += f" Posted in {departures.mention}."
+    if audience == "pax":
+        response = f"PAX flight **{flight_num}** created. Flight ID: `{flight_id}`."
+        if departures:
+            response += f" Event created and posted in {departures.mention}."
+    else:
+        response = (
+            f"STAFF flight **{flight_num}** created. Flight ID: `{flight_id}`.\n"
+            "No public Discord event or departures post was created. Use `/shortcut assign` to assign staff."
+        )
+
     if warnings_list:
         response += "\n\nWarnings:\n" + "\n".join(f"• {warning}" for warning in warnings_list)
     await interaction.followup.send(response, ephemeral=True)
@@ -4324,7 +4352,8 @@ async def flightcancel_cmd(interaction: discord.Interaction, flight_id: str, rea
     del active_flights[fid]; save_data()
     await interaction.followup.send(f"Flight `{fid}` cancelled. {notified} staff notified.", ephemeral=True)
 
-@tree.command(name="flightupdate", description="Send a live operational update to departures (Director+)", guild=discord.Object(id=GUILD_ID))
+
+@tree.command(name="flightupdate", description="Send a live operational update for a flight (Director+)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     flight_id="Flight ID",
     status="Operational update",
@@ -4361,11 +4390,15 @@ async def flightupdate_cmd(
     if not is_senior(interaction.user):
         await interaction.followup.send("Director+ only.", ephemeral=True)
         return
+
     fid = flight_id.upper()
     flight = active_flights.get(fid)
     if not flight:
         await interaction.followup.send("Flight ID not found.", ephemeral=True)
         return
+
+    audience = flight.get("audience", "pax")
+    is_pax = audience == "pax"
 
     if status in {"boarding", "final_call", "gate_change", "checkin_open", "checkin_closed"} and not (gate or flight.get("gate")):
         await interaction.followup.send("Please provide a gate or check-in desk for this update.", ephemeral=True)
@@ -4389,6 +4422,7 @@ async def flightupdate_cmd(
             await interaction.followup.send("The banner URL must begin with http:// or https://.", ephemeral=True)
             return
         flight["image_url"] = banner_url
+
     effective_banner = flight.get("image_url")
     if not effective_banner:
         await interaction.followup.send("This flight has no banner. Provide `banner_url` for the update.", ephemeral=True)
@@ -4401,6 +4435,7 @@ async def flightupdate_cmd(
             return
         flight["departure_time"] = new_time
         flight["departure_time_utc"] = new_departure_dt.isoformat()
+
     flight["status"] = status
     flight["last_update_note"] = note or ""
     flight["last_updated_at"] = now().isoformat()
@@ -4413,8 +4448,8 @@ async def flightupdate_cmd(
     messages = {
         "checkin_open": f"Dear passengers, check-in for flight **{flight.get('flight_num')}** to **{route}** is now open at **{current_gate}**.",
         "checkin_closed": f"Dear passengers, check-in for flight **{flight.get('flight_num')}** to **{route}** is now closed.",
-        "server_unlocked": f"The airport server for flight **{flight.get('flight_num')}** has now been unlocked. Use the button below to join the airport.",
-        "server_locked": f"The airport server for flight **{flight.get('flight_num')}** is now locked. New passengers can no longer join.",
+        "server_unlocked": f"Dear passengers, the airport server for flight **{flight.get('flight_num')}** has now been unlocked. Use the button below to join the airport.",
+        "server_locked": f"Dear passengers, the airport server for flight **{flight.get('flight_num')}** is now locked. New passengers can no longer join.",
         "gate_change": f"Dear passengers, flight **{flight.get('flight_num')}** has moved to **Gate {current_gate}**.",
         "boarding": f"Dear passengers, flight **{flight.get('flight_num')}** to **{route}** is now boarding at **Gate {current_gate}**.",
         "final_call": f"Final call for flight **{flight.get('flight_num')}** to **{route}** at **Gate {current_gate}**. Please board immediately.",
@@ -4437,23 +4472,41 @@ async def flightupdate_cmd(
     update_embed.add_field(name="Gate", value=current_gate, inline=True)
     update_embed.add_field(name="Departure", value=f"{flight.get('departure_time', 'N/A')} UK", inline=True)
     update_embed.set_image(url=effective_banner)
-    update_embed.set_footer(text=f"Jet2.rblx Departures | Flight ID: {fid}")
+    update_embed.set_footer(
+        text=(
+            f"Jet2.rblx Departures | Flight ID: {fid}"
+            if is_pax else
+            f"Jet2.rblx Staff Operations | Flight ID: {fid}"
+        )
+    )
 
-    departures = get_departures_channel(interaction.guild)
     sent_public = False
-    if departures:
-        mention = "@everyone" if status == "server_unlocked" else None
-        try:
-            await departures.send(
-                content=mention,
-                embed=update_embed,
-                view=FlightLinkView(flight.get("airport_link"), flight.get("scheduled_event_url")),
-                allowed_mentions=discord.AllowedMentions(everyone=True) if mention else discord.AllowedMentions.none(),
-            )
-            sent_public = True
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+    role_pinged = False
 
+    # Passenger flights announce in departures and ping the Passenger role.
+    if is_pax:
+        departures = get_departures_channel(interaction.guild)
+        if departures:
+            passenger_role = discord.utils.get(interaction.guild.roles, name="Passenger")
+            mention = passenger_role.mention if passenger_role else None
+            try:
+                await departures.send(
+                    content=mention,
+                    embed=update_embed,
+                    view=FlightLinkView(flight.get("airport_link"), flight.get("scheduled_event_url")),
+                    allowed_mentions=discord.AllowedMentions(
+                        roles=True,
+                        everyone=False,
+                        users=False,
+                        replied_user=False,
+                    ),
+                )
+                sent_public = True
+                role_pinged = passenger_role is not None
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    # Every accepted/selected staff member assigned to the flight receives the update by DM.
     notified = 0
     assigned_ids = {
         int(assignment["staff_id"])
@@ -4463,25 +4516,30 @@ async def flightupdate_cmd(
     for staff_id in assigned_ids:
         try:
             user = await fetch_delivery_user(staff_id)
-            await user.send(embed=update_embed, view=FlightLinkView(flight.get("airport_link"), flight.get("scheduled_event_url")))
+            await user.send(
+                embed=update_embed,
+                view=FlightLinkView(flight.get("airport_link"), flight.get("scheduled_event_url")),
+            )
             notified += 1
         except (discord.Forbidden, discord.HTTPException, AttributeError):
             pass
 
-    event = await get_flight_event(interaction.guild, flight)
-    if event:
-        try:
-            if status == "delayed":
-                start_dt = datetime.datetime.fromisoformat(flight["departure_time_utc"])
-                await event.edit(
-                    start_time=start_dt,
-                    end_time=start_dt + datetime.timedelta(minutes=FLIGHT_EVENT_DURATION_MINUTES),
-                    reason=f"Flight delay update by {interaction.user}",
-                )
-            elif status == "cancelled":
-                await event.cancel(reason=f"Flight cancelled by {interaction.user}: {note}")
-        except (discord.Forbidden, discord.HTTPException, ValueError, TypeError):
-            pass
+    # Only PAX flights have a Discord scheduled event to update.
+    if is_pax:
+        event = await get_flight_event(interaction.guild, flight)
+        if event:
+            try:
+                if status == "delayed":
+                    start_dt = datetime.datetime.fromisoformat(flight["departure_time_utc"])
+                    await event.edit(
+                        start_time=start_dt,
+                        end_time=start_dt + datetime.timedelta(minutes=FLIGHT_EVENT_DURATION_MINUTES),
+                        reason=f"Flight delay update by {interaction.user}",
+                    )
+                elif status == "cancelled":
+                    await event.cancel(reason=f"Flight cancelled by {interaction.user}: {note}")
+            except (discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+                pass
 
     if status == "cancelled":
         for assignment in assignments.values():
@@ -4489,14 +4547,27 @@ async def flightupdate_cmd(
                 assignment["status"] = "cancelled"
         save_data()
 
-    await refresh_departures_message(interaction.guild, fid)
-    await interaction.followup.send(
-        f"Update sent. Public departures post: **{'yes' if sent_public else 'no'}**. Assigned staff DM'd: **{notified}**.",
-        ephemeral=True,
-    )
+    if is_pax:
+        await refresh_departures_message(interaction.guild, fid)
+
+    if is_pax:
+        await interaction.followup.send(
+            (
+                f"PAX update sent. Departures announcement: **{'yes' if sent_public else 'no'}**. "
+                f"Passenger role pinged: **{'yes' if role_pinged else 'no'}**. "
+                f"Assigned staff DM'd: **{notified}**."
+            ),
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            f"STAFF update sent privately. Assigned staff DM'd: **{notified}**. No passenger announcement was posted.",
+            ephemeral=True,
+        )
 
 
-@tree.command(name="flightended", description="End a flight and survey random passengers who reacted (Director+)", guild=discord.Object(id=GUILD_ID))
+
+@tree.command(name="flightended", description="End a flight and survey random PAX passengers who reacted (Director+)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     flight_id="Flight ID",
     survey_count="Maximum random passengers to survey (1-15)",
@@ -4510,91 +4581,105 @@ async def flightended_cmd(interaction: discord.Interaction, flight_id: str, surv
     if not 1 <= survey_count <= 15:
         await interaction.followup.send("Survey count must be between 1 and 15.", ephemeral=True)
         return
+
     fid = flight_id.upper()
     flight = active_flights.get(fid)
     if not flight:
         await interaction.followup.send("Flight ID not found.", ephemeral=True)
         return
+
+    is_pax = flight.get("audience", "pax") == "pax"
+
     if banner_url:
+        if not banner_url.startswith(("http://", "https://")):
+            await interaction.followup.send("The banner URL must begin with http:// or https://.", ephemeral=True)
+            return
         flight["image_url"] = banner_url
+
     flight["status"] = "ended"
     flight["ended_at"] = now().isoformat()
     flight["ended_by"] = interaction.user.display_name
     active_flights[fid] = flight
     save_data()
 
-    departures = get_departures_channel(interaction.guild)
-    if departures:
-        embed = discord.Embed(
-            title=f"Flight Complete — {flight.get('flight_num', 'N/A')}",
-            description=(
-                f"Flight **{flight.get('flight_num', 'N/A')}** from **{flight_route_text(flight)}** has now ended.\n\n"
-                "Thank you for flying with Jet2.rblx. We hope you enjoyed your journey."
-            ),
-            color=0x22C55E,
-            timestamp=now(),
-        )
-        if flight.get("image_url"):
-            embed.set_image(url=flight["image_url"])
-        embed.set_footer(text=f"Jet2.rblx Flight Operations | Flight ID: {fid}")
-        try:
-            await departures.send(embed=embed)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-    event = await get_flight_event(interaction.guild, flight)
-    if event:
-        try:
-            if event.status == discord.EventStatus.active:
-                await event.end(reason=f"Flight ended by {interaction.user}")
-            elif event.status == discord.EventStatus.scheduled:
-                await event.cancel(reason=f"Flight marked ended by {interaction.user}")
-        except (discord.Forbidden, discord.HTTPException, ValueError):
-            pass
-
-    response_map = flight_responses.get(fid, {})
-    reactor_ids = [int(uid) for uid, response in response_map.items() if response == "joining"]
-    members = [interaction.guild.get_member(uid) for uid in reactor_ids]
-    passengers = [member for member in members if member and not member.bot and not is_staff(member)]
-    candidates = passengers or [member for member in members if member and not member.bot]
-    selected = random.sample(candidates, k=min(survey_count, len(candidates))) if candidates else []
-
-    survey = {
-        "flight_num": flight.get("flight_num", "N/A"),
-        "route": flight_route_text(flight),
-        "invited_ids": [],
-        "responses": {},
-        "created_at": now().isoformat(),
-        "created_by": interaction.user.display_name,
-    }
-    sent = 0
-    for member in selected:
-        try:
-            feedback_embed = discord.Embed(
-                title="How was your Jet2.rblx flight?",
+    if is_pax:
+        departures = get_departures_channel(interaction.guild)
+        if departures:
+            embed = discord.Embed(
+                title=f"Flight Complete — {flight.get('flight_num', 'N/A')}",
                 description=(
-                    f"You reacted as attending **{flight.get('flight_num', 'N/A')}** on **{flight_route_text(flight)}**.\n\n"
-                    "Please rate your experience using one of the buttons below."
+                    f"Flight **{flight.get('flight_num', 'N/A')}** from **{flight_route_text(flight)}** has now ended.\n\n"
+                    "Thank you for flying with Jet2.rblx. We hope you enjoyed your journey."
                 ),
-                color=JET2_RED,
+                color=0x22C55E,
                 timestamp=now(),
             )
             if flight.get("image_url"):
-                feedback_embed.set_image(url=flight["image_url"])
-            feedback_embed.set_footer(text="Jet2.rblx Passenger Experience Survey")
-            await member.send(embed=feedback_embed, view=FlightFeedbackView(fid))
-            survey["invited_ids"].append(str(member.id))
-            sent += 1
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-    feedback_surveys[fid] = survey
-    save_data()
+                embed.set_image(url=flight["image_url"])
+            embed.set_footer(text=f"Jet2.rblx Flight Operations | Flight ID: {fid}")
+            try:
+                await departures.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
 
-    await refresh_departures_message(interaction.guild, fid)
-    await interaction.followup.send(
-        f"Flight `{fid}` marked as ended. Random passenger surveys sent: **{sent}**.",
-        ephemeral=True,
-    )
+        event = await get_flight_event(interaction.guild, flight)
+        if event:
+            try:
+                if event.status == discord.EventStatus.active:
+                    await event.end(reason=f"Flight ended by {interaction.user}")
+                elif event.status == discord.EventStatus.scheduled:
+                    await event.cancel(reason=f"Flight marked ended by {interaction.user}")
+            except (discord.Forbidden, discord.HTTPException, ValueError):
+                pass
+
+        response_map = flight_responses.get(fid, {})
+        reactor_ids = [int(uid) for uid, response in response_map.items() if response == "joining"]
+        members = [interaction.guild.get_member(uid) for uid in reactor_ids]
+        passengers = [member for member in members if member and not member.bot and not is_staff(member)]
+        candidates = passengers or [member for member in members if member and not member.bot]
+        selected = random.sample(candidates, k=min(survey_count, len(candidates))) if candidates else []
+
+        survey = {
+            "flight_num": flight.get("flight_num", "N/A"),
+            "route": flight_route_text(flight),
+            "invited_ids": [],
+            "responses": {},
+            "created_at": now().isoformat(),
+            "created_by": interaction.user.display_name,
+        }
+        sent = 0
+        for member in selected:
+            try:
+                feedback_embed = discord.Embed(
+                    title="How was your Jet2.rblx flight?",
+                    description=(
+                        f"You reacted as attending **{flight.get('flight_num', 'N/A')}** on **{flight_route_text(flight)}**.\n\n"
+                        "Please rate your experience using one of the buttons below."
+                    ),
+                    color=JET2_RED,
+                    timestamp=now(),
+                )
+                if flight.get("image_url"):
+                    feedback_embed.set_image(url=flight["image_url"])
+                feedback_embed.set_footer(text="Jet2.rblx Passenger Experience Survey")
+                await member.send(embed=feedback_embed, view=FlightFeedbackView(fid))
+                survey["invited_ids"].append(str(member.id))
+                sent += 1
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        feedback_surveys[fid] = survey
+        save_data()
+
+        await refresh_departures_message(interaction.guild, fid)
+        await interaction.followup.send(
+            f"PAX flight `{fid}` marked as ended. Random passenger surveys sent: **{sent}**.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            f"STAFF flight `{fid}` marked as ended. No public announcement or passenger survey was sent.",
+            ephemeral=True,
+        )
 
 
 # ── CONFIG & WELCOME ──────────────────────────────────────────────────────────
