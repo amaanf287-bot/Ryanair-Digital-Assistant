@@ -44,6 +44,12 @@ ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID"))
 DEPARTURES_CHANNEL_ID   = int(os.getenv("DEPARTURES_CHANNEL_ID", str(ANNOUNCEMENT_CHANNEL_ID)))
 FLIGHT_EVENT_DURATION_MINUTES = max(30, min(360, int(os.getenv("FLIGHT_EVENT_DURATION_MINUTES", "120"))))
 
+# Anti-raid notifications. Add both user IDs in Railway for reliable DMs.
+RYAN_USER_ID = int(os.getenv("RYAN_USER_ID", "0") or 0)
+RYLAN_USER_ID = int(os.getenv("RYLAN_USER_ID", "0") or 0)
+ANTI_RAID_TIMEOUT_DAYS = max(1, min(28, int(os.getenv("ANTI_RAID_TIMEOUT_DAYS", "28"))))
+ANTI_RAID_FALLBACK_NAMES = {"ryan", "gamerxking765", "rylan", "adamw__2432"}
+
 # New Jet2.rblx hierarchy defaults. Environment variables can still override
 # these if your Railway deployment already uses custom role names.
 ROLE_LOCK   = os.getenv("ROLE_LOCK_NAME",   "Executive Access")
@@ -115,6 +121,9 @@ assignment_pools = {}; feedback_surveys = {}
 allow_permissions = {}; level_config = {}; raid_timestamps = {}
 owner_ai_sessions = {}; blacklist = set(); role_slot_counts = {}
 assignment_pool_locks = {}
+applications = {}; anti_raid_removed_roles = {}
+inactivity_tasks_started = set(); processed_audit_entries = set()
+protected_guild_icon_bytes = None
 persistent_views_loaded = False
 
 # ── JET2.RBLX ROLE MODEL ──────────────────────────────────────────────────────
@@ -378,6 +387,7 @@ def load_data():
     global flight_responses, active_flights, assignments, allow_permissions
     global assignment_pools, feedback_surveys
     global level_config, blacklist, role_slot_counts, ai_ticket_enabled
+    global applications, anti_raid_removed_roles, last_activity
     if os.path.exists("data.json"):
         with open("data.json", "r") as f:
             d = json.load(f)
@@ -410,6 +420,13 @@ def load_data():
             blacklist             = set(int(x) for x in d.get("blacklist", []))
             role_slot_counts      = d.get("role_slot_counts", {})
             ai_ticket_enabled     = d.get("ai_ticket_enabled", True)
+            applications          = d.get("applications", {})
+            anti_raid_removed_roles = {int(k): [int(x) for x in v] for k, v in d.get("anti_raid_removed_roles", {}).items()}
+            last_activity         = {
+                int(k): datetime.datetime.fromisoformat(v)
+                for k, v in d.get("last_activity", {}).items()
+                if isinstance(v, str)
+            }
 
 def save_data():
     with open("data.json", "w") as f:
@@ -443,6 +460,9 @@ def save_data():
             "blacklist":             list(blacklist),
             "role_slot_counts":      role_slot_counts,
             "ai_ticket_enabled":     ai_ticket_enabled,
+            "applications":          applications,
+            "anti_raid_removed_roles": {str(k): v for k, v in anti_raid_removed_roles.items()},
+            "last_activity":         {str(k): v.isoformat() for k, v in last_activity.items()},
         }, f, indent=2)
 
 def get_user_level(member):
@@ -531,8 +551,14 @@ def has_temp_permission(user_id, cmd):
     return cmd in p.get("commands", [])
 
 def log_action(uid, action, detail=""):
-    if uid not in command_log: command_log[uid] = []
-    command_log[uid].append({"time": now().strftime("%Y-%m-%d %H:%M UTC"), "action": action, "detail": detail})
+    if uid not in command_log:
+        command_log[uid] = []
+    command_log[uid].append({
+        "time": now().strftime("%Y-%m-%d %H:%M UTC"),
+        "action": action,
+        "detail": str(detail)[:3500],
+    })
+    command_log[uid] = command_log[uid][-1000:]
     save_data()
 
 def log_mod(uid, action, by, reason=""):
@@ -586,6 +612,71 @@ async def log_to_channel(action, detail, user, color=JET2_RED):
         await ch.send(embed=e)
     except: pass
 
+
+
+def safe_interaction_options(interaction):
+    try:
+        data = interaction.data or {}
+        options = data.get("options", [])
+        rendered = json.dumps(options, ensure_ascii=False, default=str)
+        return rendered[:2800]
+    except Exception:
+        return "Unable to read options"
+
+
+async def log_ticket_transcript(direction, channel, author, content, attachments=None):
+    attachment_lines = [getattr(item, "url", str(item)) for item in (attachments or [])]
+    body = content.strip() if content and content.strip() else "*No text — attachment only.*"
+    if attachment_lines:
+        body += "\n\n**Attachments:**\n" + "\n".join(attachment_lines[:10])
+    detail = (
+        f"**Direction:** {direction}\n"
+        f"**Ticket:** {channel.mention} (`{channel.id}`)\n"
+        f"**Author:** {author.mention} (`{author.id}`)\n\n"
+        f"{body[:3000]}"
+    )
+    await log_to_channel("Ticket Message", detail, author, 0x5865F2)
+
+
+async def global_tree_interaction_check(interaction: discord.Interaction):
+    command_name = interaction.command.qualified_name if interaction.command else str((interaction.data or {}).get("name", "unknown"))
+    channel_text = interaction.channel.mention if getattr(interaction.channel, "mention", None) else f"DM / {interaction.channel_id}"
+    detail = (
+        f"**Command:** `/{command_name}`\n"
+        f"**Channel:** {channel_text}\n"
+        f"**User ID:** `{interaction.user.id}`\n"
+        f"**Options:** `{safe_interaction_options(interaction)}`"
+    )
+    log_action(interaction.user.id, f"/{command_name}", detail)
+    asyncio.create_task(log_to_channel("Command Run", detail, interaction.user, 0x3498DB))
+    guild = bot.get_guild(GUILD_ID)
+    if interaction.user.id in raid_locked and guild and not is_protected_account(interaction.user, guild):
+        await interaction.response.send_message(
+            "Your account is anti-raid locked. Ryan or Rylan must unlock it before you can use bot commands.",
+            ephemeral=True,
+        )
+        return False
+    return True
+
+# CommandTree.interaction_check is designed to be overridden globally.
+tree.interaction_check = global_tree_interaction_check
+
+
+@tree.error
+async def global_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure) and interaction.user.id in raid_locked:
+        return
+    command_name = interaction.command.qualified_name if interaction.command else "unknown"
+    detail = f"**Command:** `/{command_name}`\n**Error:** `{type(error).__name__}: {str(error)[:2500]}`"
+    asyncio.create_task(log_to_channel("Command Error", detail, interaction.user, 0xE74C3C))
+    if not interaction.response.is_done():
+        await interaction.response.send_message("The command hit an error. It has been recorded in the logging channel.", ephemeral=True)
+    else:
+        try:
+            await interaction.followup.send("The command hit an error. It has been recorded in the logging channel.", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
 AI_SYSTEM_STAFF = (
     "You are the Jet2.rblx Digital Assistant for a Roblox aviation community.\n"
     "Help staff with Jet2.rblx flights, recruitment, airport operations, customer support, "
@@ -622,11 +713,16 @@ async def call_groq(messages, system=AI_SYSTEM_STAFF, max_tokens=1024):
 
 
 async def ticket_ai_respond(channel, user, msg_content):
-    if not ai_ticket_enabled: return
     cid = channel.id
-    if cid not in ticket_ai_history: ticket_ai_history[cid] = []
+    if not ai_ticket_enabled or not ticket_ai_active.get(cid, False) or connected_staff.get(cid):
+        return
+    if cid not in ticket_ai_history:
+        ticket_ai_history[cid] = []
     ticket_ai_history[cid].append({"role": "user", "content": msg_content})
     reply = await call_groq(ticket_ai_history[cid], system=TICKET_AI_SYSTEM, max_tokens=600)
+    # A human may connect or reply while the AI request is processing.
+    if not ticket_ai_active.get(cid, False) or connected_staff.get(cid):
+        return
     ticket_ai_history[cid].append({"role": "assistant", "content": reply})
     is_serious  = "[SERIOUS]"     in reply
     is_resolved = "[RESOLVED]"    in reply
@@ -652,7 +748,8 @@ async def ticket_ai_respond(channel, user, msg_content):
     if is_resolved: ticket_ai_active[cid] = False
 
 async def start_ticket_ai(channel, user):
-    if not ai_ticket_enabled: return
+    if not ai_ticket_enabled:
+        return
     ticket_ai_active[channel.id] = True
     ticket_ai_history[channel.id] = []
     greeting = await call_groq(
@@ -687,7 +784,7 @@ async def assign_ticket_to_staff(guild, channel, user, tried_ids=None):
             description=(
                 f"Dear **{chosen.display_name}**,\n\nA new support ticket has been directly assigned to you.\n\n"
                 f"**User:** {user.display_name}\n**Ticket:** {channel.mention}\n\n"
-                f"Every time you use `/connected` to claim a ticket it gets logged against your profile. "
+                f"Every time you use `/connect` to claim a ticket it gets logged against your profile. "
                 f"Your claim history can be used towards pay, promotions, and more — so make sure you claim the ticket!\n\n"
                 f"If not claimed, it transfers at <t:{transfer_time}:T> (<t:{transfer_time}:R>)."
             ),
@@ -743,23 +840,59 @@ async def ticket_no_reply_monitor(channel_id, user_id):
             except: pass
 
 async def inactivity_monitor(channel_id, user_id):
-    await asyncio.sleep(86400)
-    guild = bot.get_guild(GUILD_ID)
-    channel = guild.get_channel(channel_id)
-    if not channel or channel_id not in tickets.values(): return
-    last = last_activity.get(channel_id)
-    if last and (now() - last).total_seconds() < 86400: return
-    user = bot.get_user(user_id)
-    if user:
-        try: await user.send(embed=plain_embed("Your ticket will close due to inactivity in 1 hour. Please reply to keep it open."))
-        except: pass
-    if channel: await channel.send(embed=plain_embed("Inactivity warning sent. Ticket closes in 1 hour if no reply."))
-    await asyncio.sleep(3600)
-    channel = guild.get_channel(channel_id)
-    if not channel or channel_id not in tickets.values(): return
-    last = last_activity.get(channel_id)
-    if last and (now() - last).total_seconds() < 87600: return
-    await close_ticket(channel, user_id, "Automatic (Inactivity)", "Inactivity")
+    if channel_id in inactivity_tasks_started:
+        return
+    inactivity_tasks_started.add(channel_id)
+    try:
+        while True:
+            guild = bot.get_guild(GUILD_ID)
+            channel = guild.get_channel(channel_id) if guild else None
+            if not channel or channel_id not in tickets.values():
+                return
+
+            last = last_activity.get(channel_id, now())
+            idle_seconds = (now() - last).total_seconds()
+            if idle_seconds < 8 * 3600:
+                await asyncio.sleep(min(1800, max(60, (8 * 3600) - idle_seconds)))
+                continue
+
+            warning_reference = last
+            warning_text = (
+                "**Ticket inactivity warning**\n\n"
+                "This ticket has been inactive for 8 hours and will close automatically in 3 hours. "
+                "Please say something for it to stay open."
+            )
+            await channel.send(embed=plain_embed(warning_text, 0xF39C12))
+            user = bot.get_user(user_id)
+            if not user:
+                try:
+                    user = await bot.fetch_user(user_id)
+                except (discord.NotFound, discord.HTTPException):
+                    user = None
+            if user:
+                try:
+                    await user.send(embed=plain_embed(warning_text, 0xF39C12))
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+            await log_to_channel(
+                "Ticket Inactivity Warning",
+                f"Ticket: {channel.mention}\nUser: <@{user_id}>\nCloses in 3 hours without a reply.",
+                bot.user,
+                0xF39C12,
+            )
+
+            await asyncio.sleep(3 * 3600)
+            guild = bot.get_guild(GUILD_ID)
+            channel = guild.get_channel(channel_id) if guild else None
+            if not channel or channel_id not in tickets.values():
+                return
+            if last_activity.get(channel_id, warning_reference) > warning_reference:
+                continue
+            await close_ticket(channel, user_id, "Automatic (Inactivity)", "No activity for 11 hours")
+            return
+    finally:
+        inactivity_tasks_started.discard(channel_id)
+
 
 async def close_ticket(channel, user_id, closed_by, reason="Issue resolved"):
     guild = bot.get_guild(GUILD_ID)
@@ -776,6 +909,7 @@ async def close_ticket(channel, user_id, closed_by, reason="Issue resolved"):
         e.set_footer(text="Jet2.rblx Digital Assistant")
         await log_channel.send(embed=e)
     connected_staff.pop(channel.id, None); last_activity.pop(channel.id, None)
+    inactivity_tasks_started.discard(channel.id)
     ticket_ai_active.pop(channel.id, None); ticket_ai_history.pop(channel.id, None)
     ticket_notes.pop(channel.id, None); ticket_priority.pop(channel.id, None)
     ticket_assigned_staff.pop(channel.id, None)
@@ -980,7 +1114,7 @@ async def open_ticket(user, category_name, opened_by_staff=None, reason=None):
             description=(f"**Thank you for contacting Jet2.rblx Digital Assistant**\n\nHello, **{user.display_name}**!\n\n"
                          f"Your ticket has been opened under **{category_name}**.\n\n"
                          f"{f'**Reason:** {reason}' + chr(10) + chr(10) if reason else ''}"
-                         "Our AI assistant will be with you shortly, and a staff member will assist you as soon as possible."),
+                         "A staff member will assist you as soon as possible. The AI will only respond if a staff member chooses `/aideal`."),
             color=JET2_RED
         )
         e.set_footer(text="Jet2.rblx Digital Assistant")
@@ -990,7 +1124,7 @@ async def open_ticket(user, category_name, opened_by_staff=None, reason=None):
     staff_e = discord.Embed(
         description=(f"**New Support Ticket — {category_name}**\n\nUser: {user.mention}\n{opened_by_text}\n"
                      f"{f'Reason: {reason}' + chr(10) if reason else ''}\n"
-                     "Use `/connected` to connect · `/close` to close\nAI is handling this ticket until a staff member connects."),
+                     "Use `/connect` to connect · `/closerequest` to ask the user to close · `/close` to close.\nThe AI is OFF unless `/aideal` is run."),
         color=JET2_RED, timestamp=now()
     )
     staff_e.set_author(name=user.display_name, icon_url=user.display_avatar.url)
@@ -1003,9 +1137,11 @@ async def open_ticket(user, category_name, opened_by_staff=None, reason=None):
         log_e.set_footer(text="Jet2.rblx Digital Assistant")
         await log_channel.send(embed=log_e)
     log_action(user.id, "Ticket Opened", category_name)
+    ticket_ai_active[channel.id] = False
+    ticket_ai_history[channel.id] = []
+    save_data()
     if category_name != "Staff Hub":
         bot.loop.create_task(assign_ticket_to_staff(guild, channel, user))
-        bot.loop.create_task(start_ticket_ai(channel, user))
         bot.loop.create_task(inactivity_monitor(channel.id, user.id))
         bot.loop.create_task(ticket_no_reply_monitor(channel.id, user.id))
     else:
@@ -1139,6 +1275,63 @@ class CloseRequestView(discord.ui.View):
         channel = guild.get_channel(self.channel_id)
         if channel: await channel.send(embed=plain_embed("Closure request declined. Ticket remains open."))
         self.stop()
+
+class UserCloseRequestView(discord.ui.View):
+    def __init__(self, channel_id, user_id, requested_by_id, reason):
+        super().__init__(timeout=10800)
+        self.channel_id = channel_id
+        self.user_id = user_id
+        self.requested_by_id = requested_by_id
+        self.reason = reason
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This closure request is not for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, close my ticket", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+        await interaction.response.send_message("Your ticket will now be closed.", ephemeral=True)
+        guild = bot.get_guild(GUILD_ID)
+        channel = guild.get_channel(self.channel_id) if guild else None
+        if channel:
+            await close_ticket(channel, self.user_id, interaction.user.mention, self.reason)
+        self.stop()
+
+    @discord.ui.button(label="No, keep it open", style=discord.ButtonStyle.danger)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+        last_activity[self.channel_id] = now()
+        save_data()
+        await interaction.response.send_message("Your ticket will remain open.", ephemeral=True)
+        guild = bot.get_guild(GUILD_ID)
+        channel = guild.get_channel(self.channel_id) if guild else None
+        if channel:
+            requester = guild.get_member(self.requested_by_id)
+            await channel.send(embed=plain_embed(
+                f"The ticket opener chose to keep this ticket open."
+                f"{f' Requested by {requester.mention}.' if requester else ''}"
+            ))
+        self.stop()
+
+    async def on_timeout(self):
+        guild = bot.get_guild(GUILD_ID)
+        channel = guild.get_channel(self.channel_id) if guild else None
+        if channel:
+            await channel.send(embed=plain_embed("The close request expired after 3 hours. The ticket remains open."))
+
 
 class FlightResponseView(discord.ui.View):
     def __init__(self, flight_id):
@@ -2162,11 +2355,397 @@ async def handle_owner_ai_dm(message):
         e.set_footer(text="Jet2.rblx Owner AI — Type !endai to end session")
         await message.channel.send(embed=e)
 
+# ── ANTI-RAID PROTECTION ──────────────────────────────────────────────────────
+DANGEROUS_PERMISSION_NAMES = {
+    "administrator", "manage_guild", "manage_roles", "manage_channels",
+    "kick_members", "ban_members", "manage_webhooks", "manage_events",
+}
+
+
+def is_protected_account(user, guild):
+    if not user:
+        return False
+    if user.id in {guild.owner_id, getattr(bot.user, "id", 0), RYAN_USER_ID, RYLAN_USER_ID}:
+        return True
+    username = getattr(user, "name", "").lower()
+    display = getattr(user, "display_name", "").lower()
+    return username in ANTI_RAID_FALLBACK_NAMES or display in ANTI_RAID_FALLBACK_NAMES
+
+
+async def get_recent_audit_entry(guild, action, target_id=None):
+    await asyncio.sleep(1.2)
+    after = now() - datetime.timedelta(seconds=20)
+    try:
+        async for entry in guild.audit_logs(limit=10, action=action, after=after):
+            entry_target_id = getattr(entry.target, "id", None)
+            if target_id is not None and entry_target_id != target_id:
+                continue
+            if entry.id in processed_audit_entries:
+                continue
+            processed_audit_entries.add(entry.id)
+            if len(processed_audit_entries) > 500:
+                processed_audit_entries.clear()
+            return entry
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+    return None
+
+
+async def restore_raid_locked_member(user_id):
+    guild = bot.get_guild(GUILD_ID)
+    member = guild.get_member(user_id) if guild else None
+    if not member:
+        raid_locked.discard(user_id)
+        mod_locked.discard(user_id)
+        anti_raid_removed_roles.pop(user_id, None)
+        save_data()
+        return False
+    roles = [guild.get_role(role_id) for role_id in anti_raid_removed_roles.get(user_id, [])]
+    roles = [role for role in roles if role and role < guild.me.top_role]
+    if roles:
+        try:
+            await member.add_roles(*roles, reason="Anti-raid lock removed by protected owner")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    try:
+        await member.timeout(None, reason="Anti-raid lock removed by protected owner")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    raid_locked.discard(user_id)
+    mod_locked.discard(user_id)
+    anti_raid_removed_roles.pop(user_id, None)
+    save_data()
+    return True
+
+
+class AntiRaidUnlockView(discord.ui.View):
+    def __init__(self, user_id, display_name):
+        super().__init__(timeout=86400)
+        self.user_id = user_id
+        self.display_name = display_name
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        guild = bot.get_guild(GUILD_ID)
+        if not guild or not is_protected_account(interaction.user, guild):
+            await interaction.response.send_message("Only Ryan or Rylan can use this anti-raid control.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Unlock and restore roles", style=discord.ButtonStyle.success)
+    async def unlock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        restored = await restore_raid_locked_member(self.user_id)
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+        await interaction.response.send_message(
+            f"{self.display_name} was {'unlocked' if restored else 'cleared from the lock list'}.",
+            ephemeral=True,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Keep locked", style=discord.ButtonStyle.danger)
+    async def keep_locked(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+        await interaction.response.send_message(f"{self.display_name} remains anti-raid locked.", ephemeral=True)
+        self.stop()
+
+
+async def notify_anti_raid_owners(guild, actor, action, target, restored_text):
+    recipients = {}
+    if guild.owner:
+        recipients[guild.owner.id] = guild.owner
+    for user_id in (RYAN_USER_ID, RYLAN_USER_ID):
+        if user_id:
+            member = guild.get_member(user_id)
+            if member:
+                recipients[member.id] = member
+    for member in guild.members:
+        if member.name.lower() in ANTI_RAID_FALLBACK_NAMES or member.display_name.lower() in ANTI_RAID_FALLBACK_NAMES:
+            recipients[member.id] = member
+    e = discord.Embed(
+        title="Anti-Raid Protection Triggered",
+        description=(
+            f"**Staff member:** {actor} (`{actor.id}`)\n"
+            f"**Action:** {action}\n"
+            f"**Target:** {target}\n\n"
+            f"**System response:** {restored_text}\n\n"
+            "The member's dangerous roles were removed and their account was locked."
+        ),
+        color=0xE74C3C,
+        timestamp=now(),
+    )
+    e.set_footer(text="Jet2.rblx Anti-Raid")
+    for recipient in recipients.values():
+        try:
+            await recipient.send(embed=e, view=AntiRaidUnlockView(actor.id, str(actor)))
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+async def anti_raid_lock_actor(guild, actor, action, target, restored_text):
+    if not actor or is_protected_account(actor, guild):
+        return
+    member = guild.get_member(actor.id)
+    if not member:
+        return
+    removable = []
+    for role in member.roles:
+        if role.is_default() or role >= guild.me.top_role:
+            continue
+        permissions = role.permissions
+        if any(getattr(permissions, permission, False) for permission in DANGEROUS_PERMISSION_NAMES):
+            removable.append(role)
+    if removable:
+        anti_raid_removed_roles[member.id] = sorted(set(
+            anti_raid_removed_roles.get(member.id, []) + [role.id for role in removable]
+        ))
+        try:
+            await member.remove_roles(*removable, reason=f"Anti-raid lock: {action}")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    try:
+        until = now() + datetime.timedelta(days=ANTI_RAID_TIMEOUT_DAYS)
+        await member.timeout(until, reason=f"Anti-raid lock: {action}")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    raid_locked.add(member.id)
+    mod_locked.add(member.id)
+    save_data()
+    try:
+        await member.send(embed=plain_embed(
+            f"**Your staff account has been anti-raid locked.**\n\n"
+            f"Action detected: **{action}**\nTarget: **{target}**\n\n"
+            "Ryan and Rylan have been notified."
+        , 0xE74C3C))
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    await notify_anti_raid_owners(guild, member, action, target, restored_text)
+    await log_to_channel(
+        "ANTI-RAID LOCK",
+        f"Actor: {member.mention} (`{member.id}`)\nAction: {action}\nTarget: {target}\nResponse: {restored_text}",
+        member,
+        0xE74C3C,
+    )
+
+
+@bot.event
+async def on_guild_update(before, after):
+    global protected_guild_icon_bytes
+    if after.id != GUILD_ID:
+        return
+    icon_changed = before.icon != after.icon
+    name_changed = before.name != after.name
+    if not icon_changed and not name_changed:
+        return
+    entry = await get_recent_audit_entry(after, discord.AuditLogAction.guild_update)
+    actor = entry.user if entry else None
+    if actor and is_protected_account(actor, after):
+        if icon_changed:
+            try:
+                protected_guild_icon_bytes = await after.icon.read() if after.icon else None
+            except discord.HTTPException:
+                pass
+        await log_to_channel("Authorised Server Update", f"Changed by {actor}. Name/icon update allowed.", actor)
+        return
+    try:
+        old_icon = await before.icon.read() if before.icon else protected_guild_icon_bytes
+        kwargs = {"reason": "Jet2.rblx anti-raid rollback"}
+        if name_changed:
+            kwargs["name"] = before.name
+        if icon_changed:
+            kwargs["icon"] = old_icon
+        await after.edit(**kwargs)
+        restored = "The previous server name/logo was restored."
+    except (discord.Forbidden, discord.HTTPException, TypeError):
+        restored = "Rollback failed; check the bot's Manage Server permission."
+    if actor:
+        await anti_raid_lock_actor(after, actor, "Unauthorised server name/logo change", after.name, restored)
+
+
+@bot.event
+async def on_guild_role_delete(role):
+    guild = role.guild
+    if guild.id != GUILD_ID:
+        return
+    member_ids = [member.id for member in role.members]
+    entry = await get_recent_audit_entry(guild, discord.AuditLogAction.role_delete, role.id)
+    actor = entry.user if entry else None
+    if not actor or is_protected_account(actor, guild):
+        if actor:
+            await log_to_channel("Authorised Role Deletion", f"Role: {role.name} (`{role.id}`)", actor)
+        return
+    restored = "Role restoration failed."
+    try:
+        replacement = await guild.create_role(
+            name=role.name,
+            permissions=role.permissions,
+            colour=role.colour,
+            hoist=role.hoist,
+            mentionable=role.mentionable,
+            reason="Jet2.rblx anti-raid role restoration",
+        )
+        try:
+            await replacement.edit(position=min(role.position, guild.me.top_role.position - 1))
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        for member_id in member_ids:
+            member = guild.get_member(member_id)
+            if member:
+                try:
+                    await member.add_roles(replacement, reason="Restore deleted role membership")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+        for guild_id, cfg in level_config.items():
+            for key, value in list(cfg.items()):
+                if str(value) == str(role.id):
+                    cfg[key] = replacement.id
+        save_data()
+        restored = f"Role recreated as {replacement.mention} and cached memberships were restored."
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    await anti_raid_lock_actor(guild, actor, "Unauthorised role deletion", f"{role.name} ({role.id})", restored)
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    guild = channel.guild
+    if guild.id != GUILD_ID:
+        return
+    ticket_user_id = get_user_id_from_channel(channel.id)
+    category_children = [child.id for child in getattr(channel, "channels", [])]
+    entry = await get_recent_audit_entry(guild, discord.AuditLogAction.channel_delete, channel.id)
+    actor = entry.user if entry else None
+    if not actor or is_protected_account(actor, guild):
+        if actor:
+            await log_to_channel("Authorised Channel Deletion", f"Channel: {channel.name} (`{channel.id}`)", actor)
+        return
+    restored = "Channel restoration failed."
+    try:
+        replacement = await channel.clone(reason="Jet2.rblx anti-raid channel restoration")
+        try:
+            await replacement.edit(position=channel.position)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        if ticket_user_id:
+            tickets[ticket_user_id] = replacement.id
+            last_activity[replacement.id] = last_activity.pop(channel.id, now())
+            ticket_ai_active[replacement.id] = False
+            save_data()
+            asyncio.create_task(inactivity_monitor(replacement.id, ticket_user_id))
+        if isinstance(channel, discord.CategoryChannel):
+            for child_id in category_children:
+                child = guild.get_channel(child_id)
+                if child:
+                    try:
+                        await child.edit(category=replacement)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+        restored = f"Channel recreated as {replacement.mention if hasattr(replacement, 'mention') else replacement.name}. Message history cannot be restored."
+    except (discord.Forbidden, discord.HTTPException, AttributeError):
+        pass
+    await anti_raid_lock_actor(guild, actor, "Unauthorised channel deletion", f"{channel.name} ({channel.id})", restored)
+
+
+@bot.event
+async def on_guild_role_update(before, after):
+    guild = after.guild
+    if guild.id != GUILD_ID:
+        return
+    entry = await get_recent_audit_entry(guild, discord.AuditLogAction.role_update, after.id)
+    actor = entry.user if entry else None
+    if not actor or is_protected_account(actor, guild):
+        return
+    dangerous_before = any(getattr(before.permissions, p, False) for p in DANGEROUS_PERMISSION_NAMES)
+    dangerous_after = any(getattr(after.permissions, p, False) for p in DANGEROUS_PERMISSION_NAMES)
+    if not dangerous_after and before.name == after.name:
+        return
+    restored = "Role changes could not be restored."
+    try:
+        await after.edit(
+            name=before.name,
+            permissions=before.permissions,
+            colour=before.colour,
+            hoist=before.hoist,
+            mentionable=before.mentionable,
+            reason="Jet2.rblx anti-raid role rollback",
+        )
+        restored = "The previous role name and permissions were restored."
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    await anti_raid_lock_actor(guild, actor, "Unauthorised role permission/name change", f"{after.name} ({after.id})", restored)
+
+
+@bot.event
+async def on_member_remove(member):
+    guild = member.guild
+    if guild.id != GUILD_ID:
+        return
+    entry = await get_recent_audit_entry(guild, discord.AuditLogAction.kick, member.id)
+    action_name = "kick"
+    if not entry:
+        entry = await get_recent_audit_entry(guild, discord.AuditLogAction.ban, member.id)
+        action_name = "ban"
+    if not entry:
+        await log_to_channel("Member Left", f"Member: {member} (`{member.id}`)", member, 0x95A5A6)
+        return
+    actor = entry.user
+    if not actor or is_protected_account(actor, guild):
+        if actor:
+            await log_to_channel(f"Authorised Member {action_name.title()}", f"Member: {member} (`{member.id}`)", actor)
+        return
+    restored = "The removed member cannot be forced back into Discord."
+    if action_name == "kick":
+        invite_channel = guild.system_channel or next(
+            (channel for channel in guild.text_channels if channel.permissions_for(guild.me).create_instant_invite),
+            None,
+        )
+        if invite_channel:
+            try:
+                invite = await invite_channel.create_invite(max_uses=1, max_age=86400, unique=True, reason="Anti-raid kick recovery")
+                await member.send(embed=plain_embed(
+                    f"You were removed by an unauthorised staff action. Here is a one-use invite to return:\n{invite.url}",
+                    0xE74C3C,
+                ))
+                restored = "A one-use return invite was sent to the kicked member."
+            except (discord.Forbidden, discord.HTTPException):
+                restored = "A return invite could not be delivered to the kicked member."
+    await anti_raid_lock_actor(guild, actor, f"Unauthorised member {action_name}", f"{member} ({member.id})", restored)
+
+
 # ── EVENTS ────────────────────────────────────────────────────────────────────
 @bot.event
+async def on_command(ctx):
+    detail = (
+        f"**Command:** `{ctx.message.content[:1500]}`\n"
+        f"**Channel:** {getattr(ctx.channel, 'mention', 'DM')}\n"
+        f"**User ID:** `{ctx.author.id}`"
+    )
+    log_action(ctx.author.id, f"!{ctx.command.qualified_name if ctx.command else 'unknown'}", detail)
+    asyncio.create_task(log_to_channel("Prefix Command Run", detail, ctx.author, 0x3498DB))
+
+@bot.event
 async def on_ready():
-    global persistent_views_loaded
+    global persistent_views_loaded, protected_guild_icon_bytes
     load_data()
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        try:
+            protected_guild_icon_bytes = await guild.icon.read() if guild.icon else None
+        except discord.HTTPException:
+            protected_guild_icon_bytes = None
+        for user_id, channel_id in list(tickets.items()):
+            channel = guild.get_channel(channel_id)
+            if channel:
+                last_activity.setdefault(channel_id, now())
+                asyncio.create_task(inactivity_monitor(channel_id, user_id))
     if not persistent_views_loaded:
         bot.add_view(TicketChannelView())
         for pool_id, pool in assignment_pools.items():
@@ -2176,8 +2755,8 @@ async def on_ready():
             if survey.get("invited_ids"):
                 bot.add_view(FlightFeedbackView(flight_id))
         persistent_views_loaded = True
-    await tree.sync(guild=discord.Object(id=GUILD_ID))
-    print(f"Jet2.rblx Digital Assistant online as {bot.user}")
+    synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
+    print(f"Jet2.rblx Digital Assistant online as {bot.user} — synced {len(synced)} commands")
 
 @auto_bot.event
 async def on_ready():
@@ -2253,20 +2832,52 @@ async def on_raw_reaction_remove(payload):
 
 @bot.event
 async def on_message(message):
-    if message.author.bot: return
+    if message.author.bot:
+        return
+
+    # Ticket DMs are handled before the owner AI. This fixes the server owner's
+    # ticket messages being swallowed by the private owner-AI handler.
+    if isinstance(message.channel, discord.DMChannel) and message.author.id in tickets:
+        guild = bot.get_guild(GUILD_ID)
+        channel = guild.get_channel(tickets[message.author.id]) if guild else None
+        if channel:
+            last_activity[channel.id] = now()
+            save_data()
+            content = message.content.strip() if message.content else ""
+            e = discord.Embed(
+                description=content or "*Attachment sent by the ticket opener.*",
+                color=JET2_RED,
+                timestamp=now(),
+            )
+            e.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
+            e.set_footer(text="Ticket Opener Message")
+            if message.attachments:
+                e.add_field(
+                    name="Attachments",
+                    value="\n".join(a.url for a in message.attachments[:10])[:1024],
+                    inline=False,
+                )
+            await channel.send(embed=e)
+            await log_ticket_transcript("User DM → Staff Ticket", channel, message.author, content, message.attachments)
+            if ticket_ai_active.get(channel.id, False) and ai_ticket_enabled and not connected_staff.get(channel.id):
+                asyncio.create_task(ticket_ai_respond(channel, message.author, content or "The user sent an attachment."))
+        return
 
     if isinstance(message.channel, discord.DMChannel):
         guild = bot.get_guild(GUILD_ID)
         if guild and message.author.id == guild.owner_id and message.author.id not in ai_sessions:
             if not message.content.startswith("!"):
-                await handle_owner_ai_dm(message); return
+                await handle_owner_ai_dm(message)
+                return
 
     if isinstance(message.channel, discord.DMChannel) and message.author.id in ai_sessions:
         if message.content.startswith("!"):
-            await bot.process_commands(message); return
+            await bot.process_commands(message)
+            return
         session = ai_sessions[message.author.id]
         system = AI_SYSTEM_STAFF
-        if ai_presets: system += "\n\nAdditional instructions:\n" + "\n".join(f"- {v}" for v in ai_presets.values())
+        if ai_presets:
+            system += "\n\nAdditional instructions:\n" + "\n".join(f"- {v}" for v in ai_presets.values())
         session.append({"role": "user", "content": message.content})
         reply = await call_groq(session[-20:], system=system)
         session.append({"role": "assistant", "content": reply})
@@ -2278,57 +2889,81 @@ async def on_message(message):
     if not isinstance(message.channel, discord.DMChannel):
         if is_ticket_channel(message.channel.id):
             guild = bot.get_guild(GUILD_ID)
-            member = guild.get_member(message.author.id)
+            member = guild.get_member(message.author.id) if guild else None
             cid = message.channel.id
             user_id = get_user_id_from_channel(cid)
             user = bot.get_user(user_id) if user_id else None
+            if not user and user_id:
+                try:
+                    user = await bot.fetch_user(user_id)
+                except (discord.NotFound, discord.HTTPException):
+                    user = None
+
             if member and not is_support_staff(member) and guild.roles:
                 for role in guild.roles:
                     if role.name in (ALL_STAFF_ROLE_NAMES | {ROLE_LOCK, ROLE_SENIOR, ROLE_STAFF}) and role.mention in message.content:
                         warned = staff_ping_warned.get(message.author.id, [])
                         if cid not in warned:
-                            warned.append(cid); staff_ping_warned[message.author.id] = warned
-                            await message.channel.send(embed=plain_embed(f"{message.author.mention} Please do not ping staff roles in tickets. A member of our team will be with you shortly."))
+                            warned.append(cid)
+                            staff_ping_warned[message.author.id] = warned
+                            await message.channel.send(embed=plain_embed(
+                                f"{message.author.mention} Please do not ping staff roles in tickets. A member of our team will be with you shortly."
+                            ))
                         else:
-                            warnings[message.author.id] = warnings.get(message.author.id, 0) + 1; save_data()
-                            await message.channel.send(embed=plain_embed(f"{message.author.mention} Automatic warning issued for repeatedly pinging staff in tickets. (Warning #{warnings[message.author.id]})"))
+                            warnings[message.author.id] = warnings.get(message.author.id, 0) + 1
+                            save_data()
+                            await message.channel.send(embed=plain_embed(
+                                f"{message.author.mention} Automatic warning issued for repeatedly pinging staff in tickets. "
+                                f"(Warning #{warnings[message.author.id]})"
+                            ))
                             log_mod(message.author.id, "Auto-Warning (Staff Ping)", "System", "Repeated staff ping in ticket")
                         break
-            if member and is_support_staff(member) and not message.content.startswith("/"):
+
+            if member and is_support_staff(member):
+                # Any normal human staff reply immediately and permanently pauses AI
+                # until /aideal is deliberately run again.
                 ticket_ai_active[cid] = False
-                if user_id and user:
-                    last_activity[cid] = now()
-                    e = discord.Embed(description=message.content, color=JET2_RED, timestamp=now())
+                last_activity[cid] = now()
+                save_data()
+                content = message.content.strip() if message.content else ""
+                if user and (content or message.attachments):
+                    e = discord.Embed(
+                        description=content or "*A staff member sent an attachment.*",
+                        color=JET2_RED,
+                        timestamp=now(),
+                    )
                     e.set_author(name=member.display_name, icon_url=member.display_avatar.url)
                     e.set_footer(text=f"Jet2.rblx Staff Team | {get_staff_role_name(member)}")
-                    if message.attachments: e.set_image(url=message.attachments[0].url)
-                    try: await user.send(embed=e)
-                    except: pass
-            elif member and not is_support_staff(member):
-                if user_id and user: last_activity[cid] = now()
-                if ticket_ai_active.get(cid, False) and ai_ticket_enabled and not is_support_staff(member):
-                    if user: bot.loop.create_task(ticket_ai_respond(message.channel, user, message.content))
+                    if message.attachments:
+                        e.add_field(
+                            name="Attachments",
+                            value="\n".join(a.url for a in message.attachments[:10])[:1024],
+                            inline=False,
+                        )
+                    try:
+                        await user.send(embed=e)
+                    except (discord.Forbidden, discord.HTTPException):
+                        await message.channel.send(embed=plain_embed(
+                            "I could not deliver that reply because the ticket opener has DMs disabled."
+                        ))
+                    await log_ticket_transcript("Staff Ticket → User DM", message.channel, member, content, message.attachments)
+            elif member:
+                last_activity[cid] = now()
+                save_data()
+                if ticket_ai_active.get(cid, False) and ai_ticket_enabled and user and not connected_staff.get(cid):
+                    asyncio.create_task(ticket_ai_respond(message.channel, user, message.content or "The user sent an attachment."))
+
         await bot.process_commands(message)
         return
 
     user = message.author
-    if user.id in tickets:
-        guild = bot.get_guild(GUILD_ID)
-        channel = guild.get_channel(tickets[user.id])
-        if channel:
-            last_activity[channel.id] = now()
-            e = discord.Embed(description=message.content, color=JET2_RED, timestamp=now())
-            e.set_author(name=user.display_name, icon_url=user.display_avatar.url)
-            e.set_footer(text="User Message")
-            if message.attachments: e.set_image(url=message.attachments[0].url)
-            await channel.send(embed=e)
-            if ticket_ai_active.get(channel.id, False) and ai_ticket_enabled:
-                bot.loop.create_task(ticket_ai_respond(channel, user, message.content))
+    if user.id in pending_confirm:
         return
-
-    if user.id in pending_confirm: return
     pending_confirm[user.id] = True
-    e = discord.Embed(description="**Jet2.rblx Digital Assistant**\n\nHello, I'm Jet2.rblx's **Digital Assistant!**\nAre you looking for assistance?", color=JET2_RED)
+    e = discord.Embed(
+        description="**Jet2.rblx Digital Assistant**\n\nHello, I'm Jet2.rblx's **Digital Assistant!**\nAre you looking for assistance?",
+        color=JET2_RED,
+    )
     e.set_author(name="Assistance", icon_url=bot.user.display_avatar.url)
     e.set_footer(text="Jet2.rblx Digital Assistant")
     await send_optional_banner(user, SUPPORT_BANNER)
@@ -2346,10 +2981,10 @@ async def endai(ctx):
         await ctx.send(embed=plain_embed("Owner AI session ended."))
 
 # ── TICKET COMMANDS ───────────────────────────────────────────────────────────
-@tree.command(name="connected", description="Connect yourself to this ticket (Customer Support Team+)", guild=discord.Object(id=GUILD_ID))
-async def connected(interaction: discord.Interaction):
+@tree.command(name="connect", description="Connect yourself to this ticket and pause AI (Customer Support Team+)", guild=discord.Object(id=GUILD_ID))
+async def connect_ticket(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    if not is_support_staff(interaction.user) and not has_temp_permission(interaction.user.id, "connected"):
+    if not is_support_staff(interaction.user) and not has_temp_permission(interaction.user.id, "connect"):
         await interaction.followup.send("Customer Support Team level required.", ephemeral=True); return
     if not is_ticket_channel(interaction.channel_id):
         await interaction.followup.send("Not a ticket channel.", ephemeral=True); return
@@ -2384,11 +3019,11 @@ async def unconnected(interaction: discord.Interaction):
     if connected_staff.get(interaction.channel_id) != interaction.user.id:
         await interaction.followup.send("You are not connected to this ticket.", ephemeral=True); return
     del connected_staff[interaction.channel_id]
-    ticket_ai_active[interaction.channel_id] = True
+    ticket_ai_active[interaction.channel_id] = False
     save_data()
     guild = bot.get_guild(GUILD_ID)
     user_id = get_user_id_from_channel(interaction.channel_id)
-    await interaction.channel.send(embed=plain_embed(f"{interaction.user.mention} has disconnected. AI will assist until another agent connects."))
+    await interaction.channel.send(embed=plain_embed(f"{interaction.user.mention} has disconnected. AI remains paused; another staff member must connect or run `/aideal`."))
     user = bot.get_user(user_id) if user_id else None
     if user:
         try: await user.send(embed=plain_embed(f"{interaction.user.display_name} has disconnected. Another team member will be with you shortly."))
@@ -2433,6 +3068,52 @@ async def close_cmd(interaction: discord.Interaction, reason: str = "Issue resol
     await interaction.followup.send("Closing ticket...", ephemeral=True)
     await asyncio.sleep(1)
     await close_ticket(interaction.channel, user_id, interaction.user.mention, reason)
+
+
+@tree.command(name="closerequest", description="Ask the ticket opener whether they want the ticket closed (Customer Support Team+)", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(reason="Why you are requesting closure")
+async def closerequest_cmd(interaction: discord.Interaction, reason: str = "The issue appears to be resolved"):
+    await interaction.response.defer(ephemeral=True)
+    if not is_support_staff(interaction.user):
+        await interaction.followup.send("Customer Support Team level required.", ephemeral=True)
+        return
+    if not is_ticket_channel(interaction.channel_id):
+        await interaction.followup.send("Run this inside the ticket you want to close.", ephemeral=True)
+        return
+    user_id = get_user_id_from_channel(interaction.channel_id)
+    if not user_id:
+        await interaction.followup.send("I could not find the ticket opener.", ephemeral=True)
+        return
+    try:
+        user = await bot.fetch_user(user_id)
+        view = UserCloseRequestView(interaction.channel_id, user_id, interaction.user.id, reason)
+        e = discord.Embed(
+            title="Ticket Closure Request",
+            description=(
+                f"A staff member has asked whether you are happy for your support ticket to be closed.\n\n"
+                f"**Reason:** {reason}\n\nPlease choose an option below."
+            ),
+            color=JET2_RED,
+            timestamp=now(),
+        )
+        e.set_footer(text="Jet2.rblx Digital Assistant")
+        await user.send(embed=e, view=view)
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send("I could not DM the ticket opener. Their DMs may be disabled.", ephemeral=True)
+        return
+    ticket_ai_active[interaction.channel_id] = False
+    last_activity[interaction.channel_id] = now()
+    save_data()
+    await interaction.channel.send(embed=plain_embed(
+        f"{interaction.user.mention} sent the ticket opener a closure request.\n\n**Reason:** {reason}"
+    ))
+    await log_to_channel(
+        "Ticket Close Request",
+        f"Ticket: {interaction.channel.mention}\nUser: <@{user_id}>\nRequested by: {interaction.user.mention}\nReason: {reason}",
+        interaction.user,
+        0xF39C12,
+    )
+    await interaction.followup.send("Closure request sent to the ticket opener.", ephemeral=True)
 
 @tree.command(name="closeall", description="Close all open tickets (Owner only)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(reason="Reason")
@@ -2604,7 +3285,10 @@ async def aideal(interaction: discord.Interaction):
     if not is_support_staff(interaction.user): await interaction.followup.send("Customer Support Team level required.", ephemeral=True); return
     if not is_ticket_channel(interaction.channel_id): await interaction.followup.send("Not a ticket channel.", ephemeral=True); return
     ticket_ai_active[interaction.channel_id] = True
-    connected_staff.pop(interaction.channel_id, None); save_data()
+    connected_staff.pop(interaction.channel_id, None)
+    ticket_ai_history[interaction.channel_id] = []
+    last_activity[interaction.channel_id] = now()
+    save_data()
     user_id = get_user_id_from_channel(interaction.channel_id)
     user = bot.get_user(user_id) if user_id else None
     await interaction.channel.send(embed=plain_embed(f"{interaction.user.mention} has handed this ticket to the AI assistant."))
@@ -3321,7 +4005,6 @@ async def aiask(interaction: discord.Interaction, question: str):
     e.set_footer(text="Powered by Jet2.rblx Operations")
     await interaction.followup.send(embed=e, ephemeral=True)
 
-@tree.command(name="aistatus", description="Check AI status (Director+)", guild=discord.Object(id=GUILD_ID))
 async def aistatus(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     if not is_senior(interaction.user): await interaction.followup.send("Director+ only.", ephemeral=True); return
@@ -3367,6 +4050,272 @@ async def ai_preset_remove(interaction: discord.Interaction, name: str):
     await interaction.followup.send(f"Preset `{name}` removed.", ephemeral=True)
 
 # ── MODERATION ────────────────────────────────────────────────────────────────
+APPLICATION_QUESTIONS = {
+    "cabin_crew": {
+        "label": "Cabin Crew",
+        "questions": [
+            ("Why Cabin Crew?", "Why do you want to join the Jet2.rblx Cabin Crew team?"),
+            ("Passenger support", "How would you help a confused or upset passenger during a Roblox flight?"),
+            ("Teamwork", "Give an example of how you would work well with other cabin crew and ground staff."),
+            ("Professionalism", "How would you remain professional during a busy or disrupted flight?"),
+            ("Activity", "What experience and availability can you offer the Cabin Crew team?"),
+        ],
+    },
+    "ground_airport": {
+        "label": "Ground & Airport Operations",
+        "questions": [
+            ("Why this department?", "Why do you want to join Ground and Airport Operations?"),
+            ("Passenger queue", "How would you manage a busy check-in queue while keeping passengers informed?"),
+            ("Boarding problem", "What would you do if a passenger arrived late while boarding was closing?"),
+            ("Coordination", "How would you communicate with gate, dispatch and cabin teams during a turnaround?"),
+            ("Activity", "What experience and availability can you offer this department?"),
+        ],
+    },
+    "management": {
+        "label": "Management",
+        "questions": [
+            ("Why management?", "Why are you applying for a management position at Jet2.rblx?"),
+            ("Staff conflict", "How would you resolve a disagreement between two staff members fairly?"),
+            ("Performance", "How would you support a staff member who is repeatedly underperforming?"),
+            ("Disruption", "How would you lead the team during a delayed or disorganised flight event?"),
+            ("Improvement", "What realistic improvement would you bring to Jet2.rblx?"),
+        ],
+    },
+    "developer": {
+        "label": "Developer",
+        "questions": [
+            ("Development skills", "Which Roblox, coding, modelling or UI skills can you contribute?"),
+            ("Previous work", "Describe a project you have built and what part you personally completed."),
+            ("Bug handling", "How would you investigate and safely fix a serious live-game bug?"),
+            ("Team working", "How do you share progress, receive feedback and protect private assets or source code?"),
+            ("Availability", "How often can you contribute, and can you provide a portfolio or examples?"),
+        ],
+    },
+}
+
+
+async def score_application(application_type, answers):
+    label = APPLICATION_QUESTIONS[application_type]["label"]
+    question_text = APPLICATION_QUESTIONS[application_type]["questions"]
+    answer_text = "\n\n".join(
+        f"Question: {question}\nAnswer: {answer}"
+        for (_, question), answer in zip(question_text, answers)
+    )
+    system = (
+        "You are scoring a Roblox airline staff application. This is only a preliminary quality score, not an acceptance decision. "
+        "Score from 1 to 10 using relevance, effort, professionalism, role understanding, teamwork, judgement and completeness. "
+        "Return JSON only with keys score, summary and concerns. Keep summary and concerns under 250 characters each."
+    )
+    raw = await call_groq(
+        [{"role": "user", "content": f"Role: {label}\n\n{answer_text}"}],
+        system=system,
+        max_tokens=350,
+    )
+    try:
+        found = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(found.group(0) if found else raw)
+        score = max(1, min(10, int(round(float(data.get("score", 1))))))
+        return score, str(data.get("summary", "Application completed."))[:250], str(data.get("concerns", "None stated."))[:250]
+    except Exception:
+        words = sum(len(answer.split()) for answer in answers)
+        completed = sum(1 for answer in answers if len(answer.split()) >= 15)
+        score = max(1, min(10, round(1 + min(5, words / 55) + completed * 0.8)))
+        return score, "Preliminary score calculated from answer completeness and effort.", "Executive review is still required."
+
+
+async def send_application_to_executives(app_id, record):
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+    recipients = {}
+    if guild.owner:
+        recipients[guild.owner.id] = guild.owner
+    for user_id in (RYAN_USER_ID, RYLAN_USER_ID):
+        if user_id:
+            member = guild.get_member(user_id)
+            if member:
+                recipients[member.id] = member
+    for member in guild.members:
+        if member.name.lower() in ANTI_RAID_FALLBACK_NAMES or member.display_name.lower() in ANTI_RAID_FALLBACK_NAMES:
+            recipients[member.id] = member
+
+    summary = discord.Embed(
+        title=f"Application Review — {record['type_label']}",
+        description=(
+            f"**Application ID:** `{app_id}`\n"
+            f"**Applicant:** <@{record['user_id']}> (`{record['user_id']}`)\n"
+            f"**Sent by:** <@{record['sent_by']}>\n"
+            f"**Preliminary score:** **{record['score']}/10**\n\n"
+            f"**System summary:** {record['summary']}\n"
+            f"**Concerns:** {record['concerns']}\n\n"
+            "This score is not an automatic acceptance or rejection. An executive must review the answers."
+        ),
+        color=JET2_RED,
+        timestamp=now(),
+    )
+    summary.set_footer(text="Jet2.rblx Applications")
+
+    answer_embeds = []
+    questions = APPLICATION_QUESTIONS[record["application_type"]]["questions"]
+    for start in range(0, len(questions), 3):
+        e = discord.Embed(
+            title=f"Application Answers — {record['type_label']}",
+            color=JET2_RED,
+        )
+        for (_, question), answer in zip(questions[start:start+3], record["answers"][start:start+3]):
+            e.add_field(name=question[:256], value=answer[:1024] or "No answer", inline=False)
+        answer_embeds.append(e)
+
+    for member in recipients.values():
+        try:
+            await member.send(embed=summary)
+            for embed in answer_embeds:
+                await member.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    await log_to_channel(
+        "Application Submitted",
+        (
+            f"Application ID: `{app_id}`\nApplicant: <@{record['user_id']}>\n"
+            f"Type: {record['type_label']}\nPreliminary score: **{record['score']}/10**\n"
+            f"Summary: {record['summary']}"
+        ),
+        guild.get_member(record["sent_by"]) or bot.user,
+        0x2ECC71,
+    )
+
+
+class ApplicationModal(discord.ui.Modal):
+    def __init__(self, target_user_id, application_type, sent_by_id):
+        info = APPLICATION_QUESTIONS[application_type]
+        super().__init__(title=f"{info['label']} Application"[:45], timeout=1800)
+        self.target_user_id = target_user_id
+        self.application_type = application_type
+        self.sent_by_id = sent_by_id
+        self.inputs = []
+        for label, question in info["questions"]:
+            item = discord.ui.TextInput(
+                label=label[:45],
+                placeholder=question[:100],
+                style=discord.TextStyle.paragraph,
+                required=True,
+                min_length=20,
+                max_length=1000,
+            )
+            self.inputs.append(item)
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        answers = [str(item.value).strip() for item in self.inputs]
+        score, summary, concerns = await score_application(self.application_type, answers)
+        app_id = str(uuid.uuid4())[:8].upper()
+        info = APPLICATION_QUESTIONS[self.application_type]
+        record = {
+            "application_type": self.application_type,
+            "type_label": info["label"],
+            "user_id": interaction.user.id,
+            "sent_by": self.sent_by_id,
+            "answers": answers,
+            "score": score,
+            "summary": summary,
+            "concerns": concerns,
+            "status": "awaiting_executive_review",
+            "submitted_at": now().isoformat(),
+        }
+        applications[app_id] = record
+        save_data()
+        applicant_embed = discord.Embed(
+            title="Application Submitted",
+            description=(
+                f"Our system has marked your application as **{score}/10**.\n\n"
+                "It will be reviewed by a member of our Executive Team. Please allow up to **9 hours** for this. "
+                "If no response is given to you, please open a **General Support** ticket under **Application Inactivity**.\n\n"
+                f"**Application ID:** `{app_id}`"
+            ),
+            color=JET2_RED,
+            timestamp=now(),
+        )
+        applicant_embed.set_footer(text="Jet2.rblx Applications")
+        try:
+            await interaction.user.send(embed=applicant_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await send_application_to_executives(app_id, record)
+        log_action(interaction.user.id, "Application Submitted", f"{info['label']} — {score}/10 — ID {app_id}")
+        await interaction.followup.send(
+            f"Application submitted. Preliminary score: **{score}/10**. Application ID: `{app_id}`.",
+            ephemeral=True,
+        )
+
+
+class ApplicationStartView(discord.ui.View):
+    def __init__(self, target_user_id, application_type, sent_by_id):
+        super().__init__(timeout=86400)
+        self.target_user_id = target_user_id
+        self.application_type = application_type
+        self.sent_by_id = sent_by_id
+
+    @discord.ui.button(label="Start Application", style=discord.ButtonStyle.success)
+    async def start_application(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target_user_id:
+            await interaction.response.send_message("This application is not assigned to you.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            ApplicationModal(self.target_user_id, self.application_type, self.sent_by_id)
+        )
+
+
+@tree.command(name="application", description="Send a Jet2.rblx application form to a selected user (Customer Support Team+)", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(member="User who should receive the application", application_type="Department application to send")
+@app_commands.choices(application_type=[
+    app_commands.Choice(name="Cabin Crew", value="cabin_crew"),
+    app_commands.Choice(name="Ground & Airport Operations", value="ground_airport"),
+    app_commands.Choice(name="Management", value="management"),
+    app_commands.Choice(name="Developer", value="developer"),
+])
+async def application_cmd(interaction: discord.Interaction, member: discord.Member, application_type: str):
+    await interaction.response.defer(ephemeral=True)
+    if not is_support_staff(interaction.user):
+        await interaction.followup.send("Customer Support Team level required.", ephemeral=True)
+        return
+    if member.bot:
+        await interaction.followup.send("Applications cannot be sent to bots.", ephemeral=True)
+        return
+    info = APPLICATION_QUESTIONS.get(application_type)
+    if not info:
+        await interaction.followup.send("That application type is not available.", ephemeral=True)
+        return
+    e = discord.Embed(
+        title=f"Jet2.rblx {info['label']} Application",
+        description=(
+            f"{interaction.user.display_name} has invited you to complete a **{info['label']}** application.\n\n"
+            "Press **Start Application** below and answer every question carefully. Your answers will receive a preliminary "
+            "1–10 quality score and will then be sent to the Executive Team for human review."
+        ),
+        color=JET2_RED,
+        timestamp=now(),
+    )
+    e.set_footer(text="Jet2.rblx Applications")
+    try:
+        await member.send(
+            embed=e,
+            view=ApplicationStartView(member.id, application_type, interaction.user.id),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send("I could not DM that user. Ask them to enable direct messages.", ephemeral=True)
+        return
+    log_action(interaction.user.id, "Application Sent", f"{info['label']} to {member} ({member.id})")
+    await log_to_channel(
+        "Application Sent",
+        f"Type: {info['label']}\nApplicant: {member.mention}\nSent by: {interaction.user.mention}",
+        interaction.user,
+        0x2ECC71,
+    )
+    await interaction.followup.send(f"The **{info['label']}** application was sent to {member.mention}.", ephemeral=True)
+
+
 @tree.command(name="warn", description="Warn a user (Director+)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(member="User", reason="Reason")
 async def warn(interaction: discord.Interaction, member: discord.Member, reason: str):
@@ -3687,16 +4636,27 @@ async def modhistory_cmd(interaction: discord.Interaction, member: discord.Membe
     for h in history[-15:]: e.add_field(name=f"{h['action']} — {h['time']}", value=f"By: {h['by']}\nReason: {h.get('reason','N/A')}", inline=False)
     await interaction.followup.send(embed=e, ephemeral=True)
 
-@tree.command(name="logs", description="View full action log for a user (Owner only)", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="logs", description="View every recorded command and action for a staff member (Owner only)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(member="User")
 async def logs_cmd(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
     if not is_lock(interaction.user): await interaction.followup.send("Owner only.", ephemeral=True); return
     log = command_log.get(member.id, [])
     if not log: await interaction.followup.send(f"No logs for {member.display_name}.", ephemeral=True); return
-    e = discord.Embed(title=f"Action Logs — {member.display_name}", color=JET2_RED)
-    for entry in log[-20:]: e.add_field(name=f"{entry['action']} — {entry['time']}", value=entry.get('detail','N/A') or 'N/A', inline=False)
-    await interaction.followup.send(embed=e, ephemeral=True)
+    chunks = [log[i:i+10] for i in range(max(0, len(log)-50), len(log), 10)]
+    for index, chunk in enumerate(chunks, start=1):
+        e = discord.Embed(
+            title=f"Action Logs — {member.display_name}",
+            description=f"Showing the latest {min(50, len(log))} of {len(log)} recorded actions. Page {index}/{len(chunks)}.",
+            color=JET2_RED,
+        )
+        for entry in chunk:
+            e.add_field(
+                name=f"{entry['action']} — {entry['time']}",
+                value=(entry.get('detail','N/A') or 'N/A')[:1024],
+                inline=False,
+            )
+        await interaction.followup.send(embed=e, ephemeral=True)
 
 @tree.command(name="strike", description="Issue a strike to a staff member (Director+)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(member="Staff member", reason="Reason")
@@ -3837,12 +4797,20 @@ async def ticketchannel_cmd(interaction: discord.Interaction, channel: discord.T
     await channel.send(embed=e, view=TicketChannelView())
     await interaction.followup.send(f"Ticket opener posted in {channel.mention}.", ephemeral=True)
 
-@tree.command(name="resetraids", description="Reset all raid-locked users (Owner only)", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="resetraids", description="Restore and unlock all anti-raid locked users (Owner only)", guild=discord.Object(id=GUILD_ID))
 async def resetraids_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    if not is_lock(interaction.user): await interaction.followup.send("Owner only.", ephemeral=True); return
-    count = len(raid_locked); raid_locked.clear(); raid_timestamps.clear(); save_data()
-    await interaction.followup.send(f"Cleared {count} raid-locked users.", ephemeral=True)
+    if not is_lock(interaction.user):
+        await interaction.followup.send("Owner only.", ephemeral=True)
+        return
+    locked_ids = list(raid_locked)
+    restored = 0
+    for user_id in locked_ids:
+        if await restore_raid_locked_member(user_id):
+            restored += 1
+    raid_timestamps.clear()
+    save_data()
+    await interaction.followup.send(f"Restored and cleared {restored} anti-raid locked users.", ephemeral=True)
 
 # ── FLIGHT SYSTEM ─────────────────────────────────────────────────────────────
 shortcut_group = app_commands.Group(
@@ -3897,26 +4865,8 @@ tree.add_command(shortcut_group, guild=discord.Object(id=GUILD_ID))
 
 
 
-@tree.command(name="createflight", description="Create a passenger or staff flight (Director+)", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(
-    audience="Choose whether this is a passenger-facing flight or a staff-only flight",
-    flight_num="Flight number e.g. LS1234",
-    origin="Departing airport e.g. Manchester",
-    destination="Arrival airport e.g. Paphos",
-    airline="Brand e.g. Jet2.com",
-    departure_time="UK departure time e.g. 7:30 PM",
-    report_time="Staff report time in the UK e.g. 6:30 PM",
-    sign_out_time="Staff sign-out time in the UK e.g. 9:30 PM",
-    gate="Departure gate e.g. 12 or TBA",
-    airport_link="Roblox airport/server link",
-    image_url="Required flight banner image URL",
-    attendance_emoji="Emoji passengers react with to confirm attendance on PAX flights",
-)
-@app_commands.choices(audience=[
-    app_commands.Choice(name="PAX — Passenger Flight", value="pax"),
-    app_commands.Choice(name="STAFF — Staff-Only Flight", value="staff"),
-])
-async def createflight(
+async def create_flight_impl(
+
     interaction: discord.Interaction,
     audience: str,
     flight_num: str,
@@ -4080,6 +5030,49 @@ async def createflight(
 
 
 
+
+
+@tree.command(name="createflight", description="Create a passenger or staff flight (Director+)", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(
+    audience="Choose whether this is a passenger-facing flight or a staff-only flight",
+    flight_num="Flight number e.g. LS1234",
+    origin="Departing airport e.g. Manchester",
+    destination="Arrival airport e.g. Paphos",
+    airline="Brand e.g. Jet2.com",
+    departure_time="UK departure time e.g. 7:30 PM",
+    report_time="Staff report time in the UK e.g. 6:30 PM",
+    sign_out_time="Staff sign-out time in the UK e.g. 9:30 PM",
+    gate="Departure gate e.g. 12 or TBA",
+    airport_link="Roblox airport/server link",
+    image_url="Required flight banner image URL",
+    attendance_emoji="Emoji passengers react with to confirm attendance on PAX flights",
+)
+@app_commands.choices(audience=[
+    app_commands.Choice(name="PAX — Passenger Flight", value="pax"),
+    app_commands.Choice(name="STAFF — Staff-Only Flight", value="staff"),
+])
+async def createflight(
+
+    interaction: discord.Interaction,
+    audience: str,
+    flight_num: str,
+    origin: str,
+    destination: str,
+    airline: str,
+    departure_time: str,
+    report_time: str,
+    sign_out_time: str,
+    gate: str,
+    airport_link: str,
+    image_url: str,
+    attendance_emoji: str = "✈️",
+):
+    await create_flight_impl(
+        interaction, audience, flight_num, origin, destination, airline, departure_time,
+        report_time, sign_out_time, gate, airport_link, image_url, attendance_emoji
+    )
+
+
 @tree.command(
     name="paxflight",
     description="Create a public passenger flight, Discord event and departures post (Director+)",
@@ -4112,9 +5105,9 @@ async def paxflight_cmd(
     image_url: str,
     attendance_emoji: str = "✈️",
 ):
-    # This runs the exact PAX side of /createflight without requiring
-    # the PAX/STAFF audience dropdown.
-    await createflight.callback(
+    # Use the shared implementation directly so /paxflight does not rely on
+    # invoking another Command object's callback.
+    await create_flight_impl(
         interaction,
         "pax",
         flight_num,
@@ -4889,8 +5882,6 @@ async def staffinfo_cmd(interaction: discord.Interaction, member: discord.Member
     e.set_footer(text="Jet2.rblx Digital Assistant")
     await interaction.followup.send(embed=e, ephemeral=True)
 
-@tree.command(name="viewtickets", description="View how many tickets a staff member has claimed (Level 1+)", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(member="Staff member (blank for yourself)")
 async def viewtickets(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
     if target != interaction.user and not is_senior(interaction.user):
@@ -4924,12 +5915,12 @@ async def remind_cmd(interaction: discord.Interaction, minutes: int, message: st
 async def update_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     e = discord.Embed(title="Jet2.rblx Digital Assistant — Features & Commands", color=JET2_RED, timestamp=now())
-    e.add_field(name="🎫 Ticket System", value="`/connected` `/unconnected` `/close` `/closeall` `/forceopen` `/onhold` `/ticketrename` `/ticketnote` `/tickettransfer` `/ticketpriority` `/ticketban` `/ticketunban` `/ticketstats` `/ticketsummary` `/requeststaff` `/anonreply` `/aideal` `/supporttickets` `/snippet` `/snippetadd` `/snippetlist` `/snippetdelete` `/careers` `/say` `/pingstaff` `/ticketchannel`", inline=False)
+    e.add_field(name="🎫 Ticket System", value="`/connect` `/unconnected` `/closerequest` `/close` `/closeall` `/forceopen` `/onhold` `/ticketrename` `/ticketnote` `/tickettransfer` `/ticketpriority` `/ticketban` `/ticketunban` `/ticketstats` `/ticketsummary` `/requeststaff` `/anonreply` `/aideal` `/supporttickets` `/snippet` `/snippetadd` `/snippetlist` `/snippetdelete` `/careers` `/application` `/say` `/pingstaff` `/ticketchannel`", inline=False)
     e.add_field(name="🛡️ Moderation", value="`/warn` `/warnings` `/clearwarnings` `/timeout` `/untimeout` `/kick` `/ban` `/unban` `/softban` `/purge` `/slowmode` `/nick` `/usernick` `/role` `/roleemoji` `/massrole` `/lockdown` `/unlockdown` `/strike` `/clearstrikes` `/fire` `/modunlock` `/note` `/viewnotes` `/modhistory` `/logs` `/warndm` `/dm` `/allow` `/blacklist` `/unblacklist` `/viewblacklist`", inline=False)
     e.add_field(name="✈️ Flight System", value="`/paxflight` `/createflight` `/shortcut assign` `/flightupdate` `/flightended` `/attended` `/assign` `/reassign` `/report` `/assigned` `/flightcancel`", inline=False)
     e.add_field(name="📢 Announcements", value="`/announce` `/announcechannel` `/channelembed` `/notifydm` `/announcedm` `/embed`\nAll use popup modals — formatting is preserved exactly as you type it.", inline=False)
-    e.add_field(name="🤖 AI System", value="`/ai` `/aiask` `/aistatus` `/ai_toggle` `/ai_ticket_toggle` `/ai_preset_add` `/ai_preset_remove` `/aideal` `/ticketsummary`", inline=False)
-    e.add_field(name="⚙️ Config & Utility", value="`/config` `/roleupdate` `/welcome enable/disable` `/readonly` `/ticketchannel` `/allow` `/resetraids`\n`/membercount` `/serverinfo` `/botstatus` `/stafflist` `/onlinestaff` `/userinfo` `/staffinfo` `/viewtickets` `/remind`\n`/commands` `/update`", inline=False)
+    e.add_field(name="🤖 AI System", value="`/ai` `/aiask` `/ai_toggle` `/ai_ticket_toggle` `/ai_preset_add` `/ai_preset_remove` `/aideal` `/ticketsummary`", inline=False)
+    e.add_field(name="⚙️ Config & Utility", value="`/config` `/roleupdate` `/welcome enable/disable` `/readonly` `/ticketchannel` `/allow` `/resetraids`\n`/membercount` `/serverinfo` `/botstatus` `/stafflist` `/onlinestaff` `/userinfo` `/staffinfo` `/remind`\n`/commands` `/update`", inline=False)
     e.set_footer(text="Jet2.rblx Digital Assistant — Full Feature List")
     await interaction.followup.send(embed=e, ephemeral=True)
 
@@ -4952,7 +5943,7 @@ async def commands_cmd(interaction: discord.Interaction, category: str = "all"):
 
     if category in ("tickets","all") and level >= 3:
         e = discord.Embed(title="🎫 Ticket Commands", color=JET2_RED)
-        e.add_field(name="Customer Support Team (Level 3+)", value="`/connected` `/unconnected` `/close` `/onhold` `/anonreply` `/say` `/snippet` `/snippetlist` `/ticketnote` `/ticketstats` `/ticketsummary` `/aideal` `/requeststaff` `/supporttickets` `/careers`", inline=False)
+        e.add_field(name="Customer Support Team (Level 3+)", value="`/connect` `/unconnected` `/closerequest` `/close` `/onhold` `/anonreply` `/say` `/snippet` `/snippetlist` `/ticketnote` `/ticketstats` `/ticketsummary` `/aideal` `/requeststaff` `/supporttickets` `/careers` `/application`", inline=False)
         if level >= 4: e.add_field(name="Directors / Executives (Level 4+)", value="`/forceopen` `/ticketrename` `/tickettransfer` `/ticketpriority` `/ticketban` `/ticketunban` `/snippetadd` `/snippetdelete` `/pingstaff`", inline=False)
         if level >= 5: e.add_field(name="Owner Only", value="`/closeall` `/ticketchannel` `/info`", inline=False)
         embeds.append(e)
@@ -4979,13 +5970,13 @@ async def commands_cmd(interaction: discord.Interaction, category: str = "all"):
     if category in ("ai","all") and level >= 2:
         e = discord.Embed(title="🤖 AI Commands", color=JET2_RED)
         e.add_field(name="Level 2+", value="`/ai` — Start private AI session in DMs\n`/aiask` — Quick AI question", inline=False)
-        if level >= 4: e.add_field(name="Level 4+", value="`/ticketsummary` — AI summary of current ticket\n`/aideal` — Hand ticket fully to AI\n`/aistatus` — Check AI status", inline=False)
+        if level >= 4: e.add_field(name="Level 4+", value="`/ticketsummary` — AI summary of current ticket\n`/aideal` — Hand ticket fully to AI", inline=False)
         if level >= 5: e.add_field(name="Owner Only", value="`/ai_toggle` `/ai_ticket_toggle` `/ai_preset_add` `/ai_preset_remove`\nDM the bot directly to use AI to announce or message staff", inline=False)
         embeds.append(e)
 
     if category in ("general","all"):
         e = discord.Embed(title="⚙️ General Commands", color=JET2_RED)
-        e.add_field(name="All Staff (Level 1+)", value="`/membercount` `/serverinfo` `/botstatus` `/stafflist` `/onlinestaff` `/viewtickets` `/remind` `/commands` `/update`", inline=False)
+        e.add_field(name="All Staff (Level 1+)", value="`/membercount` `/serverinfo` `/botstatus` `/stafflist` `/onlinestaff` `/remind` `/commands` `/update`", inline=False)
         if level >= 2: e.add_field(name="Level 2+", value="`/userinfo` `/note` `/viewnotes` `/warnings`", inline=False)
         if level >= 4: e.add_field(name="Level 4+", value="`/staffinfo` `/modhistory`", inline=False)
         if level >= 5: e.add_field(name="Owner Only", value="`/config` `/roleupdate` `/welcome enable/disable` `/resetraids` `/blacklist` `/unblacklist` `/viewblacklist`", inline=False)
