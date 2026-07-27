@@ -1,16 +1,11 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import json, os, datetime, asyncio, re, uuid, shutil
-from collections import deque
+import json, os, datetime, asyncio, re, uuid, random
+import aiohttp
 from groq import Groq
 from dotenv import load_dotenv
 import pytz
-
-try:
-    import yt_dlp
-except ImportError:
-    yt_dlp = None
 
 load_dotenv()
 
@@ -46,6 +41,8 @@ GUILD_ID                = int(os.getenv("GUILD_ID"))
 TICKET_CATEGORY_ID      = int(os.getenv("TICKET_CATEGORY_ID"))
 LOG_CHANNEL_ID          = int(os.getenv("LOG_CHANNEL_ID"))
 ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID"))
+DEPARTURES_CHANNEL_ID   = int(os.getenv("DEPARTURES_CHANNEL_ID", str(ANNOUNCEMENT_CHANNEL_ID)))
+FLIGHT_EVENT_DURATION_MINUTES = max(30, min(360, int(os.getenv("FLIGHT_EVENT_DURATION_MINUTES", "120"))))
 
 # New Jet2.rblx hierarchy defaults. Environment variables can still override
 # these if your Railway deployment already uses custom role names.
@@ -114,31 +111,11 @@ raid_locked = set(); welcome_config = {}; ticket_ai_active = {}
 ticket_ai_history = {}; staff_ping_warned = {}; ticket_assigned_staff = {}
 staff_tickets_claimed = {}; pending_mod_actions = {}; mod_strike_count = {}
 flight_responses = {}; active_flights = {}; assignments = {}
+assignment_pools = {}; feedback_surveys = {}
 allow_permissions = {}; level_config = {}; raid_timestamps = {}
 owner_ai_sessions = {}; blacklist = set(); role_slot_counts = {}
-
-# ── MUSIC SYSTEM ──────────────────────────────────────────────────────────────
-# Members must accept the rules with !acceptmusicrules before using /play.
-MUSIC_MAX_DURATION_SECONDS = max(60, int(os.getenv("MUSIC_MAX_DURATION_SECONDS", "1200")))
-MUSIC_MAX_QUEUE_LENGTH = max(1, int(os.getenv("MUSIC_MAX_QUEUE_LENGTH", "20")))
-MUSIC_IDLE_TIMEOUT_SECONDS = max(30, int(os.getenv("MUSIC_IDLE_TIMEOUT_SECONDS", "180")))
-MUSIC_VOLUME = min(1.0, max(0.05, float(os.getenv("MUSIC_VOLUME", "0.45"))))
-YTDLP_COOKIE_FILE = os.getenv("YTDLP_COOKIE_FILE", "").strip()
-
-MUSIC_RULES_TEXT = (
-    "1. Only play music that is suitable for the server.\n"
-    "2. Do not play explicit, hateful, discriminatory, sexual, violent or deliberately disruptive audio.\n"
-    "3. Do not spam the queue or repeatedly interrupt other listeners.\n"
-    "4. You must remain in the same voice channel as the bot while using music commands.\n"
-    "5. Staff may skip or stop music when necessary. Misuse can result in music access being removed."
-)
-
-music_rules_accepted = set()
-music_queues = {}
-music_current = {}
-music_locks = {}
-music_starting = set()
-music_idle_tasks = {}
+assignment_pool_locks = {}
+persistent_views_loaded = False
 
 # ── JET2.RBLX ROLE MODEL ──────────────────────────────────────────────────────
 # The bot uses these names as permission levels even before /config is run.
@@ -399,8 +376,8 @@ def load_data():
     global ticket_stats, user_notes, mod_history, command_log, raid_locked
     global welcome_config, staff_tickets_claimed, mod_strike_count
     global flight_responses, active_flights, assignments, allow_permissions
+    global assignment_pools, feedback_surveys
     global level_config, blacklist, role_slot_counts, ai_ticket_enabled
-    global music_rules_accepted
     if os.path.exists("data.json"):
         with open("data.json", "r") as f:
             d = json.load(f)
@@ -426,12 +403,13 @@ def load_data():
             flight_responses      = d.get("flight_responses", {})
             active_flights        = d.get("active_flights", {})
             assignments           = d.get("assignments", {})
+            assignment_pools      = d.get("assignment_pools", {})
+            feedback_surveys      = d.get("feedback_surveys", {})
             allow_permissions     = {int(k): v for k, v in d.get("allow_permissions", {}).items()}
             level_config          = d.get("level_config", {})
             blacklist             = set(int(x) for x in d.get("blacklist", []))
             role_slot_counts      = d.get("role_slot_counts", {})
             ai_ticket_enabled     = d.get("ai_ticket_enabled", True)
-            music_rules_accepted  = set(int(x) for x in d.get("music_rules_accepted", []))
 
 def save_data():
     with open("data.json", "w") as f:
@@ -458,12 +436,13 @@ def save_data():
             "flight_responses":      flight_responses,
             "active_flights":        active_flights,
             "assignments":           assignments,
+            "assignment_pools":      assignment_pools,
+            "feedback_surveys":      feedback_surveys,
             "allow_permissions":     {str(k): v for k, v in allow_permissions.items()},
             "level_config":          level_config,
             "blacklist":             list(blacklist),
             "role_slot_counts":      role_slot_counts,
             "ai_ticket_enabled":     ai_ticket_enabled,
-            "music_rules_accepted":  sorted(music_rules_accepted),
         }, f, indent=2)
 
 def get_user_level(member):
@@ -1255,6 +1234,542 @@ class AssignmentView(discord.ui.View):
                 await owner_user.send(embed=e)
             except: pass
 
+
+# ── ADVANCED ASSIGNMENT & FLIGHT INTERACTION HELPERS ─────────────────────────
+def get_assignment_pool_lock(pool_id):
+    lock = assignment_pool_locks.get(pool_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        assignment_pool_locks[pool_id] = lock
+    return lock
+
+
+def parse_future_uk_time(time_text):
+    """Parse a UK time and move it to tomorrow when today's time has passed."""
+    parsed = parse_uk_time(time_text)
+    if not parsed:
+        return None
+    if parsed <= now() + datetime.timedelta(minutes=2):
+        parsed += datetime.timedelta(days=1)
+    return parsed
+
+
+async def download_image_bytes(url, max_bytes=8 * 1024 * 1024):
+    if not url:
+        return None
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    return None
+                data = await response.read()
+                if len(data) > max_bytes:
+                    return None
+                return data
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return None
+
+
+def flight_route_text(flight):
+    origin = flight.get("origin")
+    destination_name = flight.get("destination_name")
+    if origin and destination_name:
+        return f"{origin} → {destination_name}"
+    return flight.get("destination", "Route not set")
+
+
+def get_departures_channel(guild):
+    return guild.get_channel(DEPARTURES_CHANNEL_ID) or guild.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+
+
+def build_departures_embed(flight_id, flight):
+    status = flight.get("status", "Scheduled").replace("_", " ").title()
+    emoji = flight.get("attendance_emoji", "✈️")
+    route = flight_route_text(flight)
+    event_url = flight.get("scheduled_event_url")
+    description = (
+        f"**Airline:** {flight.get('airline', 'Jet2.com')}\n"
+        f"**Flight:** {flight.get('flight_num', 'N/A')}\n"
+        f"**Route:** {route}\n"
+        f"**Departure (UK):** {flight.get('departure_time', 'N/A')}\n"
+        f"**Gate:** {flight.get('gate', 'TBA')}\n"
+        f"**Status:** {status}\n"
+        f"{f'**Discord Event:** [View event]({event_url})' if event_url else ''}\n\n"
+        f"React with {emoji} at the bottom of this message to confirm that you are coming."
+    )
+    embed = discord.Embed(
+        title=f"{flight.get('flight_num', 'Flight')} | {route}",
+        description=description,
+        color=JET2_RED,
+        timestamp=now(),
+    )
+    if flight.get("image_url"):
+        embed.set_image(url=flight["image_url"])
+    embed.set_footer(text=f"Jet2.rblx Departures | Flight ID: {flight_id}")
+    return embed
+
+
+class FlightLinkView(discord.ui.View):
+    def __init__(self, airport_link=None, event_url=None):
+        super().__init__(timeout=None)
+        if airport_link:
+            self.add_item(discord.ui.Button(label="Open Airport", style=discord.ButtonStyle.link, url=airport_link))
+        if event_url:
+            self.add_item(discord.ui.Button(label="View Discord Event", style=discord.ButtonStyle.link, url=event_url))
+
+
+async def refresh_departures_message(guild, flight_id):
+    flight = active_flights.get(flight_id)
+    if not flight:
+        return
+    channel_id = flight.get("departures_channel_id")
+    message_id = flight.get("departures_message_id")
+    if not channel_id or not message_id:
+        return
+    channel = guild.get_channel(int(channel_id))
+    if not channel:
+        return
+    try:
+        message = await channel.fetch_message(int(message_id))
+        await message.edit(
+            embed=build_departures_embed(flight_id, flight),
+            view=FlightLinkView(flight.get("airport_link"), flight.get("scheduled_event_url")),
+        )
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def get_flight_event(guild, flight):
+    event_id = flight.get("scheduled_event_id")
+    if not event_id:
+        return None
+    event = guild.get_scheduled_event(int(event_id))
+    if event:
+        return event
+    try:
+        return await guild.fetch_scheduled_event(int(event_id))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+async def make_assignment(member, role, flight_id, created_by, note="", status="pending"):
+    flight = active_flights.get(flight_id)
+    if not flight:
+        return None, "Flight no longer exists."
+
+    report_time = flight.get("report_time", "N/A")
+    sign_out_time = flight.get("sign_out_time", "N/A")
+    report_dt = parse_uk_time(report_time)
+    aid = str(uuid.uuid4())[:8].upper()
+    assignments[aid] = {
+        "staff_id": member.id,
+        "role": role.name,
+        "role_id": str(role.id),
+        "flight_num": flight.get("flight_num", "N/A"),
+        "destination": flight_route_text(flight),
+        "airline": flight.get("airline", "Jet2.com"),
+        "report_time": report_time,
+        "report_time_utc": report_dt.isoformat() if report_dt else None,
+        "sign_out_time": sign_out_time,
+        "game_link": flight.get("airport_link", "Check with a manager"),
+        "expires_at": report_time,
+        "expires_utc": report_dt.isoformat() if report_dt else None,
+        "flight_id": flight_id,
+        "status": status,
+        "note": note or "",
+        "by": created_by,
+        "time": now().isoformat(),
+        "shortcut_assignment": True,
+    }
+    save_data()
+
+    if status == "accepted":
+        return aid, None
+
+    try:
+        embed = discord.Embed(
+            title=f"Flight Assignment — {flight.get('flight_num', 'N/A')}",
+            description=(
+                f"Dear **{member.display_name}**,\n\n"
+                f"You have been selected for the following flight assignment.\n\n"
+                f"**Role:** {role.name}\n"
+                f"**Flight:** {flight.get('flight_num', 'N/A')}\n"
+                f"**Route:** {flight_route_text(flight)}\n"
+                f"**Report Time (UK):** {report_time}\n"
+                f"**Sign Out Time (UK):** {sign_out_time}\n"
+                f"**Airport:** {flight.get('airport_link', 'Link not set')}\n"
+                f"{f'**Manager Note:** {note}' if note else ''}\n\n"
+                "Use the buttons below to accept or decline."
+            ),
+            color=JET2_RED,
+            timestamp=now(),
+        )
+        if flight.get("image_url"):
+            embed.set_image(url=flight["image_url"])
+        embed.set_footer(text=f"Jet2.rblx Assignment | ID: {aid}")
+        user = await fetch_delivery_user(member.id)
+        await user.send(embed=embed, view=AssignmentView(aid))
+    except (discord.Forbidden, discord.HTTPException, AttributeError):
+        assignments[aid]["status"] = "dm_failed"
+        save_data()
+        return aid, "Could not DM this user."
+
+    if report_dt:
+        bot.loop.create_task(assignment_reminder_monitor(aid, report_dt))
+    return aid, None
+
+
+class RolePoolInviteView(discord.ui.View):
+    def __init__(self, pool_id):
+        super().__init__(timeout=None)
+        self.pool_id = pool_id
+
+        accept = discord.ui.Button(
+            label="Accept Assignment",
+            style=discord.ButtonStyle.success,
+            custom_id=f"role_pool:{pool_id}:accept",
+        )
+        decline = discord.ui.Button(
+            label="Decline",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"role_pool:{pool_id}:decline",
+        )
+        accept.callback = self.accept_callback
+        decline.callback = self.decline_callback
+        self.add_item(accept)
+        self.add_item(decline)
+
+    async def accept_callback(self, interaction):
+        async with get_assignment_pool_lock(self.pool_id):
+            pool = assignment_pools.get(self.pool_id)
+            if not pool:
+                await interaction.response.send_message("This assignment pool no longer exists.", ephemeral=True)
+                return
+            uid = str(interaction.user.id)
+            if uid not in pool.get("invited_ids", []):
+                await interaction.response.send_message("You were not invited to this assignment.", ephemeral=True)
+                return
+            if uid in pool.get("accepted_ids", []):
+                await interaction.response.send_message("You already accepted this assignment.", ephemeral=True)
+                return
+            if pool.get("status") != "open" or len(pool.get("accepted_ids", [])) >= int(pool.get("limit", 1)):
+                await interaction.response.edit_message(content="All available positions have now been filled.", embed=None, view=None)
+                return
+
+            guild = bot.get_guild(GUILD_ID)
+            member = guild.get_member(interaction.user.id) if guild else None
+            role = guild.get_role(int(pool["role_id"])) if guild else None
+            if not member or not role:
+                await interaction.response.send_message("The member or role could not be found.", ephemeral=True)
+                return
+            if role not in member.roles:
+                await interaction.response.send_message("You no longer hold the required role.", ephemeral=True)
+                return
+
+            aid, error = await make_assignment(
+                member,
+                role,
+                pool["flight_id"],
+                pool.get("created_by", "Shortcut Assignment"),
+                pool.get("note", ""),
+                status="accepted",
+            )
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
+                return
+
+            pool.setdefault("accepted_ids", []).append(uid)
+            pool.setdefault("assignment_ids", []).append(aid)
+            if len(pool["accepted_ids"]) >= int(pool.get("limit", 1)):
+                pool["status"] = "completed"
+                pool["completed_at"] = now().isoformat()
+            assignment_pools[self.pool_id] = pool
+            save_data()
+
+            flight = active_flights.get(pool["flight_id"], {})
+            await interaction.response.edit_message(
+                content=(
+                    f"You are assigned to **{flight.get('flight_num', 'the flight')}** as "
+                    f"**{role.name}**. Your assignment ID is `{aid}`."
+                ),
+                embed=None,
+                view=None,
+            )
+
+            if pool.get("status") == "completed":
+                accepted_mentions = "\n".join(f"<@{member_id}>" for member_id in pool.get("accepted_ids", []))
+                creator_id = pool.get("created_by_id")
+                target = guild.get_member(int(creator_id)) if creator_id and guild else None
+                target = target or (guild.owner if guild else None)
+                if target:
+                    try:
+                        done_embed = discord.Embed(
+                            title="Shortcut Assignment Completed",
+                            description=(
+                                f"**Flight:** {flight.get('flight_num', 'N/A')}\n"
+                                f"**Role:** {role.name}\n"
+                                f"**Positions filled:** {len(pool.get('accepted_ids', []))}/{pool.get('limit')}\n\n"
+                                f"{accepted_mentions}"
+                            ),
+                            color=0x22C55E,
+                            timestamp=now(),
+                        )
+                        await target.send(embed=done_embed)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+
+    async def decline_callback(self, interaction):
+        pool = assignment_pools.get(self.pool_id)
+        if not pool:
+            await interaction.response.send_message("This assignment pool no longer exists.", ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        pool.setdefault("declined_ids", [])
+        if uid not in pool["declined_ids"]:
+            pool["declined_ids"].append(uid)
+        assignment_pools[self.pool_id] = pool
+        save_data()
+        await interaction.response.edit_message(content="You declined this flight assignment.", embed=None, view=None)
+
+
+class FlightFeedbackView(discord.ui.View):
+    def __init__(self, flight_id):
+        super().__init__(timeout=None)
+        self.flight_id = flight_id
+        labels = [("Excellent", 5, discord.ButtonStyle.success), ("Good", 4, discord.ButtonStyle.success),
+                  ("Okay", 3, discord.ButtonStyle.primary), ("Poor", 2, discord.ButtonStyle.danger),
+                  ("Very Poor", 1, discord.ButtonStyle.danger)]
+        for label, rating, style in labels:
+            button = discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=f"flight_feedback:{flight_id}:{rating}",
+            )
+            button.callback = self._make_callback(rating)
+            self.add_item(button)
+
+    def _make_callback(self, rating):
+        async def callback(interaction):
+            survey = feedback_surveys.get(self.flight_id)
+            if not survey:
+                await interaction.response.send_message("This feedback survey has closed.", ephemeral=True)
+                return
+            uid = str(interaction.user.id)
+            if uid not in survey.get("invited_ids", []):
+                await interaction.response.send_message("This survey was not sent to you.", ephemeral=True)
+                return
+            if uid in survey.get("responses", {}):
+                await interaction.response.send_message("You already submitted feedback.", ephemeral=True)
+                return
+            survey.setdefault("responses", {})[uid] = {
+                "rating": rating,
+                "submitted_at": now().isoformat(),
+            }
+            feedback_surveys[self.flight_id] = survey
+            save_data()
+            await interaction.response.edit_message(
+                content=f"Thank you. Your **{rating}/5** rating has been recorded.",
+                embed=None,
+                view=None,
+            )
+        return callback
+
+
+class ShortcutUserSelect(discord.ui.UserSelect):
+    def __init__(self, flight_id, role_id, note, manager_id):
+        super().__init__(placeholder="Select up to 15 users...", min_values=1, max_values=15)
+        self.flight_id = flight_id
+        self.role_id = role_id
+        self.note = note
+        self.manager_id = manager_id
+
+    async def callback(self, interaction):
+        if interaction.user.id != self.manager_id:
+            await interaction.response.send_message("This menu belongs to another manager.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        role = interaction.guild.get_role(self.role_id)
+        if not role:
+            await interaction.followup.send("The selected role no longer exists.", ephemeral=True)
+            return
+        sent, failed = [], []
+        for selected in self.values[:15]:
+            member = interaction.guild.get_member(selected.id)
+            if not member or member.bot:
+                failed.append(getattr(selected, "display_name", str(selected)))
+                continue
+            aid, error = await make_assignment(
+                member,
+                role,
+                self.flight_id,
+                interaction.user.display_name,
+                self.note,
+            )
+            if error:
+                failed.append(member.display_name)
+            else:
+                sent.append(f"{member.display_name} (`{aid}`)")
+        summary = f"Assignments sent: **{len(sent)}**."
+        if sent:
+            summary += "\n" + "\n".join(f"• {item}" for item in sent)
+        if failed:
+            summary += "\n\nCould not DM: " + ", ".join(failed)
+        await interaction.edit_original_response(content=summary, embed=None, view=None)
+
+
+class ShortcutUserSelectView(discord.ui.View):
+    def __init__(self, flight_id, role_id, note, manager_id):
+        super().__init__(timeout=300)
+        self.add_item(ShortcutUserSelect(flight_id, role_id, note, manager_id))
+
+
+class ShortcutRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, flight_id, mode, limit, note, manager_id):
+        super().__init__(placeholder="Select the assignment role...", min_values=1, max_values=1)
+        self.flight_id = flight_id
+        self.mode = mode
+        self.limit = limit
+        self.note = note
+        self.manager_id = manager_id
+
+    async def callback(self, interaction):
+        if interaction.user.id != self.manager_id:
+            await interaction.response.send_message("This menu belongs to another manager.", ephemeral=True)
+            return
+        role = self.values[0]
+        if role.is_default() or role.managed:
+            await interaction.response.send_message("Select a normal server role, not @everyone or a managed integration role.", ephemeral=True)
+            return
+
+        if self.mode == "selected_users":
+            embed = discord.Embed(
+                title="Shortcut Assignment — Select Users",
+                description=f"Flight role: **{role.name}**\nSelect between 1 and 15 users below.",
+                color=JET2_RED,
+            )
+            await interaction.response.edit_message(
+                embed=embed,
+                view=ShortcutUserSelectView(self.flight_id, role.id, self.note, self.manager_id),
+            )
+            return
+
+        candidates = [member for member in interaction.guild.members if role in member.roles and not member.bot]
+        if not candidates:
+            await interaction.response.send_message(f"Nobody currently has the **{role.name}** role.", ephemeral=True)
+            return
+
+        pool_id = str(uuid.uuid4())[:8].upper()
+        pool = {
+            "flight_id": self.flight_id,
+            "role_id": str(role.id),
+            "role_name": role.name,
+            "limit": min(max(int(self.limit), 1), 15),
+            "note": self.note or "",
+            "status": "open",
+            "created_by": interaction.user.display_name,
+            "created_by_id": str(interaction.user.id),
+            "created_at": now().isoformat(),
+            "invited_ids": [],
+            "accepted_ids": [],
+            "declined_ids": [],
+            "assignment_ids": [],
+        }
+        assignment_pools[pool_id] = pool
+        save_data()
+
+        await interaction.response.defer(ephemeral=True)
+        flight = active_flights.get(self.flight_id, {})
+        sent = 0
+        for member in candidates:
+            try:
+                embed = discord.Embed(
+                    title=f"Open Flight Assignment — {flight.get('flight_num', 'N/A')}",
+                    description=(
+                        f"A **{role.name}** assignment is available.\n\n"
+                        f"**Route:** {flight_route_text(flight)}\n"
+                        f"**Report Time (UK):** {flight.get('report_time', 'N/A')}\n"
+                        f"**Positions:** {pool['limit']}\n"
+                        f"{f'**Manager Note:** {self.note}' if self.note else ''}\n\n"
+                        "The first eligible members to accept will be assigned."
+                    ),
+                    color=JET2_RED,
+                    timestamp=now(),
+                )
+                if flight.get("image_url"):
+                    embed.set_image(url=flight["image_url"])
+                embed.set_footer(text=f"Jet2.rblx Shortcut Assignment | Pool: {pool_id}")
+                user = await fetch_delivery_user(member.id)
+                await user.send(embed=embed, view=RolePoolInviteView(pool_id))
+                pool["invited_ids"].append(str(member.id))
+                sent += 1
+            except (discord.Forbidden, discord.HTTPException, AttributeError):
+                pass
+
+        if sent == 0:
+            assignment_pools.pop(pool_id, None)
+            save_data()
+            await interaction.followup.send("No users could be DM'd. They may have DMs disabled.", ephemeral=True)
+            return
+        assignment_pools[pool_id] = pool
+        save_data()
+        await interaction.edit_original_response(
+            content=(
+                f"Shortcut assignment pool `{pool_id}` opened for **{role.name}**.\n"
+                f"DMs sent: **{sent}** | Positions available: **{pool['limit']}**"
+            ),
+            embed=None,
+            view=None,
+        )
+
+
+class ShortcutRoleSelectView(discord.ui.View):
+    def __init__(self, flight_id, mode, limit, note, manager_id):
+        super().__init__(timeout=300)
+        self.add_item(ShortcutRoleSelect(flight_id, mode, limit, note, manager_id))
+
+
+class ShortcutFlightSelect(discord.ui.Select):
+    def __init__(self, flights, mode, limit, note, manager_id):
+        options = []
+        for flight_id, flight in flights[:25]:
+            options.append(discord.SelectOption(
+                label=f"{flight.get('flight_num', '?')} | {flight_route_text(flight)}"[:100],
+                description=f"{flight.get('departure_time', 'N/A')} | {flight.get('status', 'scheduled')}"[:100],
+                value=flight_id,
+            ))
+        super().__init__(placeholder="Select a flight...", options=options)
+        self.mode = mode
+        self.limit = limit
+        self.note = note
+        self.manager_id = manager_id
+
+    async def callback(self, interaction):
+        if interaction.user.id != self.manager_id:
+            await interaction.response.send_message("This menu belongs to another manager.", ephemeral=True)
+            return
+        flight_id = self.values[0]
+        flight = active_flights.get(flight_id)
+        if not flight:
+            await interaction.response.send_message("That flight no longer exists.", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="Shortcut Assignment — Select Role",
+            description=f"Flight: **{flight.get('flight_num', 'N/A')}**\nRoute: **{flight_route_text(flight)}**",
+            color=JET2_RED,
+        )
+        await interaction.response.edit_message(
+            embed=embed,
+            view=ShortcutRoleSelectView(flight_id, self.mode, self.limit, self.note, self.manager_id),
+        )
+
+
+class ShortcutFlightSelectView(discord.ui.View):
+    def __init__(self, flights, mode, limit, note, manager_id):
+        super().__init__(timeout=300)
+        self.add_item(ShortcutFlightSelect(flights, mode, limit, note, manager_id))
+
+
 class ReportJoinView(discord.ui.View):
     def __init__(self, assignment_id, flight_id):
         super().__init__(timeout=None); self.assignment_id = assignment_id; self.flight_id = flight_id
@@ -1650,8 +2165,17 @@ async def handle_owner_ai_dm(message):
 # ── EVENTS ────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
+    global persistent_views_loaded
     load_data()
-    bot.add_view(TicketChannelView())
+    if not persistent_views_loaded:
+        bot.add_view(TicketChannelView())
+        for pool_id, pool in assignment_pools.items():
+            if pool.get("status") == "open":
+                bot.add_view(RolePoolInviteView(pool_id))
+        for flight_id, survey in feedback_surveys.items():
+            if survey.get("invited_ids"):
+                bot.add_view(FlightFeedbackView(flight_id))
+        persistent_views_loaded = True
     await tree.sync(guild=discord.Object(id=GUILD_ID))
     print(f"Jet2.rblx Digital Assistant online as {bot.user}")
 
@@ -1681,6 +2205,51 @@ async def on_member_join(member):
         await send_optional_banner(channel, banner)
         await channel.send(embed=e)
     except: pass
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    if payload.guild_id != GUILD_ID or payload.user_id == bot.user.id:
+        return
+    for flight_id, flight in active_flights.items():
+        if str(payload.message_id) != str(flight.get("departures_message_id")):
+            continue
+        if str(payload.emoji) != str(flight.get("attendance_emoji", "✈️")):
+            continue
+        guild = bot.get_guild(payload.guild_id)
+        member = guild.get_member(payload.user_id) if guild else None
+        if not member or member.bot:
+            return
+        flight_responses.setdefault(flight_id, {})[str(payload.user_id)] = "joining"
+        save_data()
+        try:
+            confirmation = discord.Embed(
+                title="Attendance Registered",
+                description=(
+                    f"You are marked as attending **{flight.get('flight_num', 'N/A')}** on **{flight_route_text(flight)}**.\n\n"
+                    "Flight updates will be posted in the departures channel."
+                ),
+                color=JET2_RED,
+            )
+            await member.send(embed=confirmation)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return
+
+
+@bot.event
+async def on_raw_reaction_remove(payload):
+    if payload.guild_id != GUILD_ID:
+        return
+    for flight_id, flight in active_flights.items():
+        if str(payload.message_id) != str(flight.get("departures_message_id")):
+            continue
+        if str(payload.emoji) != str(flight.get("attendance_emoji", "✈️")):
+            continue
+        if flight_responses.get(flight_id, {}).get(str(payload.user_id)) == "joining":
+            flight_responses[flight_id].pop(str(payload.user_id), None)
+            save_data()
+        return
+
 
 @bot.event
 async def on_message(message):
@@ -1725,7 +2294,7 @@ async def on_message(message):
                             await message.channel.send(embed=plain_embed(f"{message.author.mention} Automatic warning issued for repeatedly pinging staff in tickets. (Warning #{warnings[message.author.id]})"))
                             log_mod(message.author.id, "Auto-Warning (Staff Ping)", "System", "Repeated staff ping in ticket")
                         break
-            if member and is_support_staff(member) and not message.content.startswith(("/", "!")):
+            if member and is_support_staff(member) and not message.content.startswith("/"):
                 ticket_ai_active[cid] = False
                 if user_id and user:
                     last_activity[cid] = now()
@@ -3276,59 +3845,210 @@ async def resetraids_cmd(interaction: discord.Interaction):
     await interaction.followup.send(f"Cleared {count} raid-locked users.", ephemeral=True)
 
 # ── FLIGHT SYSTEM ─────────────────────────────────────────────────────────────
-@tree.command(name="createflight", description="Create a flight for today (Director+)", guild=discord.Object(id=GUILD_ID))
+shortcut_group = app_commands.Group(
+    name="shortcut",
+    description="Technology-assisted management shortcuts",
+)
+
+
+@shortcut_group.command(name="assign", description="Assign a role pool or up to 15 selected users to a flight")
+@app_commands.describe(
+    mode="DM everyone with a role, or manually select up to 15 users",
+    limit="For role-pool mode: how many people may accept (1-15)",
+    note="Optional message included in the assignment",
+)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Role pool — DM everyone with the selected role", value="role_pool"),
+    app_commands.Choice(name="Selected users — choose up to 15 people", value="selected_users"),
+])
+async def shortcut_assign_cmd(interaction: discord.Interaction, mode: str, limit: int = 1, note: str = None):
+    if not is_senior(interaction.user):
+        await interaction.response.send_message("Director+ only.", ephemeral=True)
+        return
+    if mode == "role_pool" and not 1 <= limit <= 15:
+        await interaction.response.send_message("The acceptance limit must be between 1 and 15.", ephemeral=True)
+        return
+    flights = [
+        (flight_id, flight)
+        for flight_id, flight in active_flights.items()
+        if flight.get("status") not in {"cancelled", "ended"}
+    ]
+    flights.sort(key=lambda item: item[1].get("departure_time_utc", item[1].get("time", "")))
+    if not flights:
+        await interaction.response.send_message("No active flights are available. Create one with `/createflight` first.", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="Shortcut Assignment — Select Flight",
+        description=(
+            "Choose the flight below. You will then select the assignment role.\n\n"
+            "**Role pool:** everyone holding the chosen role is DM'd; the assignment closes when the acceptance limit is reached.\n"
+            "**Selected users:** choose up to 15 individual users and send each an assignment."
+        ),
+        color=JET2_RED,
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        view=ShortcutFlightSelectView(flights, mode, limit, note, interaction.user.id),
+        ephemeral=True,
+    )
+
+
+tree.add_command(shortcut_group, guild=discord.Object(id=GUILD_ID))
+
+
+@tree.command(name="createflight", description="Create a public flight, Discord event and departures post (Director+)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     flight_num="Flight number e.g. LS1234",
-    origin="Departing from e.g. Manchester",
-    destination="Arriving at e.g. Paphos",
+    origin="Departing airport e.g. Manchester",
+    destination="Arrival airport e.g. Paphos",
     airline="Brand e.g. Jet2.com",
-    departure_time="Departure time UK e.g. 2:30 PM",
-    report_time="Staff report to airport by UK time e.g. 1:00 PM",
-    sign_out_time="Sign out time UK e.g. 5:00 PM",
-    airport_link="Link to the game airport",
-    image_url="Optional flight banner image URL"
+    departure_time="UK departure time e.g. 7:30 PM",
+    report_time="Staff report time in the UK e.g. 6:30 PM",
+    sign_out_time="Staff sign-out time in the UK e.g. 9:30 PM",
+    gate="Departure gate e.g. 12 or TBA",
+    airport_link="Roblox airport/server link",
+    image_url="Required public flight banner image URL",
+    attendance_emoji="Emoji passengers react with to confirm attendance",
 )
-async def createflight(interaction: discord.Interaction, flight_num: str, origin: str, destination: str,
-                       airline: str, departure_time: str, report_time: str, sign_out_time: str,
-                       airport_link: str = None, image_url: str = None):
+async def createflight(
+    interaction: discord.Interaction,
+    flight_num: str,
+    origin: str,
+    destination: str,
+    airline: str,
+    departure_time: str,
+    report_time: str,
+    sign_out_time: str,
+    gate: str,
+    airport_link: str,
+    image_url: str,
+    attendance_emoji: str = "✈️",
+):
     await interaction.response.defer(ephemeral=True)
     if not is_senior(interaction.user):
-        await interaction.followup.send("Director+ only.", ephemeral=True); return
+        await interaction.followup.send("Director+ only.", ephemeral=True)
+        return
+    if not image_url.startswith(("http://", "https://")):
+        await interaction.followup.send("A valid `http://` or `https://` banner image URL is required.", ephemeral=True)
+        return
+    if not airport_link.startswith(("http://", "https://")):
+        await interaction.followup.send("A valid Roblox airport/server link is required.", ephemeral=True)
+        return
+
+    departure_dt = parse_future_uk_time(departure_time)
+    report_dt = parse_future_uk_time(report_time)
+    if not departure_dt:
+        await interaction.followup.send("I could not understand the departure time. Try `7:30 PM` or `19:30`.", ephemeral=True)
+        return
+
     flight_id = str(uuid.uuid4())[:8].upper()
-    route = f"{origin} to {destination}"
-    active_flights[flight_id] = {
-        "flight_num": flight_num, "origin": origin, "destination": route, "airline": airline,
-        "departure_time": departure_time, "report_time": report_time, "sign_out_time": sign_out_time,
-        "airport_link": airport_link, "image_url": image_url,
-        "by": interaction.user.display_name, "time": now().isoformat(),
-        "date": now().strftime("%Y-%m-%d"),
+    route = f"{origin} → {destination}"
+    flight = {
+        "flight_num": flight_num,
+        "origin": origin,
+        "destination_name": destination,
+        "destination": route,
+        "airline": airline,
+        "departure_time": departure_time,
+        "departure_time_utc": departure_dt.isoformat(),
+        "report_time": report_time,
+        "report_time_utc": report_dt.isoformat() if report_dt else None,
+        "sign_out_time": sign_out_time,
+        "gate": gate,
+        "airport_link": airport_link,
+        "image_url": image_url,
+        "attendance_emoji": attendance_emoji.strip() or "✈️",
+        "status": "scheduled",
+        "by": interaction.user.display_name,
+        "time": now().isoformat(),
+        "date": departure_dt.astimezone(UK_TZ).strftime("%Y-%m-%d"),
     }
+
+    guild = interaction.guild
+    warnings_list = []
+
+    # Create an external Discord scheduled event with the supplied banner.
+    image_bytes = await download_image_bytes(image_url)
+    try:
+        event = await guild.create_scheduled_event(
+            name=f"{flight_num} | {route}"[:100],
+            description=(
+                f"Jet2.rblx flight {flight_num}\n"
+                f"Route: {route}\n"
+                f"Gate: {gate}\n"
+                f"Open the airport: {airport_link}"
+            )[:1000],
+            start_time=departure_dt,
+            end_time=departure_dt + datetime.timedelta(minutes=FLIGHT_EVENT_DURATION_MINUTES),
+            entity_type=discord.EntityType.external,
+            privacy_level=discord.PrivacyLevel.guild_only,
+            location=f"Jet2.rblx | {route}"[:100],
+            image=image_bytes,
+            reason=f"Flight created by {interaction.user}",
+        )
+        flight["scheduled_event_id"] = str(event.id)
+        flight["scheduled_event_url"] = event.url
+    except (discord.Forbidden, discord.HTTPException, TypeError, ValueError) as ex:
+        warnings_list.append(f"Discord event could not be created: {ex}")
+
+    active_flights[flight_id] = flight
     flight_responses[flight_id] = {}
     save_data()
-    guild = bot.get_guild(GUILD_ID)
-    owner = guild.owner
-    if owner:
+
+    departures = get_departures_channel(guild)
+    if departures:
         try:
-            e = discord.Embed(
-                title=f"New Flight Created — {flight_num}",
-                description=(
-                    f"A new flight has been created by **{interaction.user.display_name}**.\n\n"
-                    f"**Flight ID:** `{flight_id}`\n\n"
-                    f"**Airline:** {airline}\n**Flight:** {flight_num}\n**Route:** {route}\n"
-                    f"**Departure Time (UK):** {departure_time}\n**Report Time (UK):** {report_time}\n"
-                    f"**Sign Out Time (UK):** {sign_out_time}\n"
-                    f"{f'**Airport Link:** {airport_link}' if airport_link else ''}\n\n"
-                    f"Use `/assign` to assign staff to this flight.\n**Flight ID:** `{flight_id}`"
-                ),
-                color=JET2_RED, timestamp=now()
+            message = await departures.send(
+                embed=build_departures_embed(flight_id, flight),
+                view=FlightLinkView(airport_link, flight.get("scheduled_event_url")),
             )
-            if image_url: e.set_image(url=image_url)
-            e.set_footer(text="Jet2.rblx Digital Assistant — Flight Management")
-            owner_user = await bot.fetch_user(owner.id)
-            await owner_user.send(embed=e)
-        except Exception as ex:
-            print(f"Failed to DM owner flight ID: {ex}")
-    await interaction.followup.send(f"Flight **{flight_num}** created!\n**Flight ID:** `{flight_id}`\nThe owner has been DM'd the Flight ID.", ephemeral=True)
+            try:
+                await message.add_reaction(flight["attendance_emoji"])
+            except (discord.HTTPException, discord.NotFound):
+                flight["attendance_emoji"] = "✈️"
+                try:
+                    await message.add_reaction("✈️")
+                except discord.HTTPException:
+                    pass
+                warnings_list.append("The supplied reaction emoji was invalid, so ✈️ was used.")
+            flight["departures_channel_id"] = str(departures.id)
+            flight["departures_message_id"] = str(message.id)
+            active_flights[flight_id] = flight
+            save_data()
+        except (discord.Forbidden, discord.HTTPException) as ex:
+            warnings_list.append(f"Departures announcement failed: {ex}")
+    else:
+        warnings_list.append("The departures channel could not be found. Set DEPARTURES_CHANNEL_ID in Railway.")
+
+    # Send the owner a management copy containing the Flight ID.
+    if guild.owner:
+        try:
+            owner_embed = discord.Embed(
+                title=f"Flight Created — {flight_num}",
+                description=(
+                    f"**Flight ID:** `{flight_id}`\n"
+                    f"**Route:** {route}\n"
+                    f"**Departure:** {departure_time} UK\n"
+                    f"**Gate:** {gate}\n"
+                    f"**Reaction:** {flight['attendance_emoji']}\n\n"
+                    "Use `/shortcut assign` for role-pool or multi-user assignments.\n"
+                    "Use `/flightupdate` for check-in, server, boarding, delay, cancellation and landing updates."
+                ),
+                color=JET2_RED,
+                timestamp=now(),
+            )
+            owner_embed.set_image(url=image_url)
+            await guild.owner.send(embed=owner_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    response = f"Flight **{flight_num}** created. Flight ID: `{flight_id}`."
+    if departures:
+        response += f" Posted in {departures.mention}."
+    if warnings_list:
+        response += "\n\nWarnings:\n" + "\n".join(f"• {warning}" for warning in warnings_list)
+    await interaction.followup.send(response, ephemeral=True)
+
 
 @tree.command(name="flight", description="Announce a flight to all online Jet2.rblx Staff Team members (Owner only)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(flight_num="Flight number e.g. LS1234", destination="Route e.g. Manchester to Paphos", airline="Brand e.g. Jet2.com", departure_time="Departure time UK e.g. 2:30 PM", report_time="Report to airport by UK time e.g. 1:00 PM", airport_link="Link to game airport", image_url="Optional flight banner image URL")
@@ -3387,6 +4107,11 @@ async def attended_cmd(interaction: discord.Interaction, flight_id: str):
                       color=JET2_RED)
     e.add_field(name=f"Joining ({len(joining)})", value="\n".join(name(u) for u in joining) or "None", inline=True)
     e.add_field(name=f"Not Joining ({len(not_joining)})", value="\n".join(name(u) for u in not_joining) or "None", inline=True)
+    survey = feedback_surveys.get(fid, {})
+    ratings = [entry.get("rating", 0) for entry in survey.get("responses", {}).values()]
+    if ratings:
+        average = sum(ratings) / len(ratings)
+        e.add_field(name="Passenger Feedback", value=f"{len(ratings)} response(s) | Average: **{average:.1f}/5**", inline=False)
     e.set_footer(text="Jet2.rblx Digital Assistant — Flight Management")
     await interaction.followup.send(embed=e, ephemeral=True)
 
@@ -3599,36 +4324,278 @@ async def flightcancel_cmd(interaction: discord.Interaction, flight_id: str, rea
     del active_flights[fid]; save_data()
     await interaction.followup.send(f"Flight `{fid}` cancelled. {notified} staff notified.", ephemeral=True)
 
-@tree.command(name="flightupdate", description="Update flight details and notify assigned staff (Owner only)", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(flight_id="Flight ID", field="What to update", new_value="New value")
-@app_commands.choices(field=[
-    app_commands.Choice(name="Departure Time", value="departure_time"),
-    app_commands.Choice(name="Report Time",    value="report_time"),
-    app_commands.Choice(name="Destination",    value="destination"),
-    app_commands.Choice(name="Airport Link",   value="airport_link"),
-    app_commands.Choice(name="Airline",        value="airline"),
+@tree.command(name="flightupdate", description="Send a live operational update to departures (Director+)", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(
+    flight_id="Flight ID",
+    status="Operational update",
+    gate="Gate or check-in desk, when relevant",
+    new_time="New UK departure time for a delay",
+    airport_link="Updated Roblox airport/server link",
+    banner_url="Update banner; defaults to the original flight banner",
+    note="Reason or additional information, kept exactly as written",
+)
+@app_commands.choices(status=[
+    app_commands.Choice(name="Check-in Open", value="checkin_open"),
+    app_commands.Choice(name="Check-in Closed", value="checkin_closed"),
+    app_commands.Choice(name="Server Unlocked", value="server_unlocked"),
+    app_commands.Choice(name="Server Locked", value="server_locked"),
+    app_commands.Choice(name="Gate Change", value="gate_change"),
+    app_commands.Choice(name="Boarding", value="boarding"),
+    app_commands.Choice(name="Final Call", value="final_call"),
+    app_commands.Choice(name="Delayed", value="delayed"),
+    app_commands.Choice(name="Cancelled", value="cancelled"),
+    app_commands.Choice(name="Departed", value="departed"),
+    app_commands.Choice(name="Landed", value="landed"),
 ])
-async def flightupdate_cmd(interaction: discord.Interaction, flight_id: str, field: str, new_value: str):
+async def flightupdate_cmd(
+    interaction: discord.Interaction,
+    flight_id: str,
+    status: str,
+    gate: str = None,
+    new_time: str = None,
+    airport_link: str = None,
+    banner_url: str = None,
+    note: str = None,
+):
     await interaction.response.defer(ephemeral=True)
-    if not is_lock(interaction.user): await interaction.followup.send("Owner only.", ephemeral=True); return
+    if not is_senior(interaction.user):
+        await interaction.followup.send("Director+ only.", ephemeral=True)
+        return
     fid = flight_id.upper()
     flight = active_flights.get(fid)
-    if not flight: await interaction.followup.send("Flight ID not found.", ephemeral=True); return
-    old_value = flight.get(field,"N/A"); flight[field] = new_value; active_flights[fid] = flight; save_data()
+    if not flight:
+        await interaction.followup.send("Flight ID not found.", ephemeral=True)
+        return
+
+    if status in {"boarding", "final_call", "gate_change", "checkin_open", "checkin_closed"} and not (gate or flight.get("gate")):
+        await interaction.followup.send("Please provide a gate or check-in desk for this update.", ephemeral=True)
+        return
+    if status == "delayed" and not new_time:
+        await interaction.followup.send("Please provide the new departure time for a delay.", ephemeral=True)
+        return
+    if status in {"cancelled", "delayed"} and not note:
+        await interaction.followup.send("Please provide the delay/cancellation reason in `note`.", ephemeral=True)
+        return
+
+    if gate:
+        flight["gate"] = gate
+    if airport_link:
+        if not airport_link.startswith(("http://", "https://")):
+            await interaction.followup.send("The airport link must begin with http:// or https://.", ephemeral=True)
+            return
+        flight["airport_link"] = airport_link
+    if banner_url:
+        if not banner_url.startswith(("http://", "https://")):
+            await interaction.followup.send("The banner URL must begin with http:// or https://.", ephemeral=True)
+            return
+        flight["image_url"] = banner_url
+    effective_banner = flight.get("image_url")
+    if not effective_banner:
+        await interaction.followup.send("This flight has no banner. Provide `banner_url` for the update.", ephemeral=True)
+        return
+
+    if status == "delayed":
+        new_departure_dt = parse_future_uk_time(new_time)
+        if not new_departure_dt:
+            await interaction.followup.send("I could not understand the new departure time.", ephemeral=True)
+            return
+        flight["departure_time"] = new_time
+        flight["departure_time_utc"] = new_departure_dt.isoformat()
+    flight["status"] = status
+    flight["last_update_note"] = note or ""
+    flight["last_updated_at"] = now().isoformat()
+    flight["last_updated_by"] = interaction.user.display_name
+    active_flights[fid] = flight
+    save_data()
+
+    route = flight_route_text(flight)
+    current_gate = flight.get("gate", "TBA")
+    messages = {
+        "checkin_open": f"Dear passengers, check-in for flight **{flight.get('flight_num')}** to **{route}** is now open at **{current_gate}**.",
+        "checkin_closed": f"Dear passengers, check-in for flight **{flight.get('flight_num')}** to **{route}** is now closed.",
+        "server_unlocked": f"The airport server for flight **{flight.get('flight_num')}** has now been unlocked. Use the button below to join the airport.",
+        "server_locked": f"The airport server for flight **{flight.get('flight_num')}** is now locked. New passengers can no longer join.",
+        "gate_change": f"Dear passengers, flight **{flight.get('flight_num')}** has moved to **Gate {current_gate}**.",
+        "boarding": f"Dear passengers, flight **{flight.get('flight_num')}** to **{route}** is now boarding at **Gate {current_gate}**.",
+        "final_call": f"Final call for flight **{flight.get('flight_num')}** to **{route}** at **Gate {current_gate}**. Please board immediately.",
+        "delayed": f"Flight **{flight.get('flight_num')}** to **{route}** has been delayed. The new departure time is **{flight.get('departure_time')} UK**.",
+        "cancelled": f"We regret to announce that flight **{flight.get('flight_num')}** to **{route}** has been cancelled.",
+        "departed": f"Flight **{flight.get('flight_num')}** to **{route}** has departed.",
+        "landed": f"Flight **{flight.get('flight_num')}** has landed safely. Welcome to **{flight.get('destination_name', route)}**.",
+    }
+    description = messages[status]
+    if note:
+        description += f"\n\n{note}"
+
+    update_embed = discord.Embed(
+        title=f"Flight Update — {status.replace('_', ' ').title()}",
+        description=description,
+        color=0xF59E0B if status in {"delayed", "gate_change"} else (0xDC2626 if status == "cancelled" else JET2_RED),
+        timestamp=now(),
+    )
+    update_embed.add_field(name="Flight", value=flight.get("flight_num", "N/A"), inline=True)
+    update_embed.add_field(name="Gate", value=current_gate, inline=True)
+    update_embed.add_field(name="Departure", value=f"{flight.get('departure_time', 'N/A')} UK", inline=True)
+    update_embed.set_image(url=effective_banner)
+    update_embed.set_footer(text=f"Jet2.rblx Departures | Flight ID: {fid}")
+
+    departures = get_departures_channel(interaction.guild)
+    sent_public = False
+    if departures:
+        mention = "@everyone" if status == "server_unlocked" else None
+        try:
+            await departures.send(
+                content=mention,
+                embed=update_embed,
+                view=FlightLinkView(flight.get("airport_link"), flight.get("scheduled_event_url")),
+                allowed_mentions=discord.AllowedMentions(everyone=True) if mention else discord.AllowedMentions.none(),
+            )
+            sent_public = True
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
     notified = 0
-    for assignment in assignments.values():
-        if assignment.get("flight_id") == fid:
-            staff_id = assignment.get("staff_id")
-            if staff_id:
-                try:
-                    e = discord.Embed(title="Flight Update",
-                                      description=f"The following flight has been updated:\n\n**Flight:** {flight.get('flight_num','N/A')}\n**Updated:** {field.replace('_',' ').title()}\n**Old Value:** {old_value}\n**New Value:** {new_value}\n\nPlease take note of this change.",
-                                      color=0xFF9500, timestamp=now())
-                    e.set_footer(text="Jet2.rblx Digital Assistant — Flight Management")
-                    user_obj = await fetch_delivery_user(staff_id)
-                    await user_obj.send(embed=e); notified += 1
-                except: pass
-    await interaction.followup.send(f"Flight updated. {notified} assigned staff notified.", ephemeral=True)
+    assigned_ids = {
+        int(assignment["staff_id"])
+        for assignment in assignments.values()
+        if assignment.get("flight_id") == fid and assignment.get("staff_id")
+    }
+    for staff_id in assigned_ids:
+        try:
+            user = await fetch_delivery_user(staff_id)
+            await user.send(embed=update_embed, view=FlightLinkView(flight.get("airport_link"), flight.get("scheduled_event_url")))
+            notified += 1
+        except (discord.Forbidden, discord.HTTPException, AttributeError):
+            pass
+
+    event = await get_flight_event(interaction.guild, flight)
+    if event:
+        try:
+            if status == "delayed":
+                start_dt = datetime.datetime.fromisoformat(flight["departure_time_utc"])
+                await event.edit(
+                    start_time=start_dt,
+                    end_time=start_dt + datetime.timedelta(minutes=FLIGHT_EVENT_DURATION_MINUTES),
+                    reason=f"Flight delay update by {interaction.user}",
+                )
+            elif status == "cancelled":
+                await event.cancel(reason=f"Flight cancelled by {interaction.user}: {note}")
+        except (discord.Forbidden, discord.HTTPException, ValueError, TypeError):
+            pass
+
+    if status == "cancelled":
+        for assignment in assignments.values():
+            if assignment.get("flight_id") == fid:
+                assignment["status"] = "cancelled"
+        save_data()
+
+    await refresh_departures_message(interaction.guild, fid)
+    await interaction.followup.send(
+        f"Update sent. Public departures post: **{'yes' if sent_public else 'no'}**. Assigned staff DM'd: **{notified}**.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="flightended", description="End a flight and survey random passengers who reacted (Director+)", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(
+    flight_id="Flight ID",
+    survey_count="Maximum random passengers to survey (1-15)",
+    banner_url="Optional completed-flight banner; defaults to the flight banner",
+)
+async def flightended_cmd(interaction: discord.Interaction, flight_id: str, survey_count: int = 5, banner_url: str = None):
+    await interaction.response.defer(ephemeral=True)
+    if not is_senior(interaction.user):
+        await interaction.followup.send("Director+ only.", ephemeral=True)
+        return
+    if not 1 <= survey_count <= 15:
+        await interaction.followup.send("Survey count must be between 1 and 15.", ephemeral=True)
+        return
+    fid = flight_id.upper()
+    flight = active_flights.get(fid)
+    if not flight:
+        await interaction.followup.send("Flight ID not found.", ephemeral=True)
+        return
+    if banner_url:
+        flight["image_url"] = banner_url
+    flight["status"] = "ended"
+    flight["ended_at"] = now().isoformat()
+    flight["ended_by"] = interaction.user.display_name
+    active_flights[fid] = flight
+    save_data()
+
+    departures = get_departures_channel(interaction.guild)
+    if departures:
+        embed = discord.Embed(
+            title=f"Flight Complete — {flight.get('flight_num', 'N/A')}",
+            description=(
+                f"Flight **{flight.get('flight_num', 'N/A')}** from **{flight_route_text(flight)}** has now ended.\n\n"
+                "Thank you for flying with Jet2.rblx. We hope you enjoyed your journey."
+            ),
+            color=0x22C55E,
+            timestamp=now(),
+        )
+        if flight.get("image_url"):
+            embed.set_image(url=flight["image_url"])
+        embed.set_footer(text=f"Jet2.rblx Flight Operations | Flight ID: {fid}")
+        try:
+            await departures.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    event = await get_flight_event(interaction.guild, flight)
+    if event:
+        try:
+            if event.status == discord.EventStatus.active:
+                await event.end(reason=f"Flight ended by {interaction.user}")
+            elif event.status == discord.EventStatus.scheduled:
+                await event.cancel(reason=f"Flight marked ended by {interaction.user}")
+        except (discord.Forbidden, discord.HTTPException, ValueError):
+            pass
+
+    response_map = flight_responses.get(fid, {})
+    reactor_ids = [int(uid) for uid, response in response_map.items() if response == "joining"]
+    members = [interaction.guild.get_member(uid) for uid in reactor_ids]
+    passengers = [member for member in members if member and not member.bot and not is_staff(member)]
+    candidates = passengers or [member for member in members if member and not member.bot]
+    selected = random.sample(candidates, k=min(survey_count, len(candidates))) if candidates else []
+
+    survey = {
+        "flight_num": flight.get("flight_num", "N/A"),
+        "route": flight_route_text(flight),
+        "invited_ids": [],
+        "responses": {},
+        "created_at": now().isoformat(),
+        "created_by": interaction.user.display_name,
+    }
+    sent = 0
+    for member in selected:
+        try:
+            feedback_embed = discord.Embed(
+                title="How was your Jet2.rblx flight?",
+                description=(
+                    f"You reacted as attending **{flight.get('flight_num', 'N/A')}** on **{flight_route_text(flight)}**.\n\n"
+                    "Please rate your experience using one of the buttons below."
+                ),
+                color=JET2_RED,
+                timestamp=now(),
+            )
+            if flight.get("image_url"):
+                feedback_embed.set_image(url=flight["image_url"])
+            feedback_embed.set_footer(text="Jet2.rblx Passenger Experience Survey")
+            await member.send(embed=feedback_embed, view=FlightFeedbackView(fid))
+            survey["invited_ids"].append(str(member.id))
+            sent += 1
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    feedback_surveys[fid] = survey
+    save_data()
+
+    await refresh_departures_message(interaction.guild, fid)
+    await interaction.followup.send(
+        f"Flight `{fid}` marked as ended. Random passenger surveys sent: **{sent}**.",
+        ephemeral=True,
+    )
+
 
 # ── CONFIG & WELCOME ──────────────────────────────────────────────────────────
 @tree.command(name="config", description="Configure the bot level system (Owner only)", guild=discord.Object(id=GUILD_ID))
@@ -3677,397 +4644,6 @@ async def welcome_cmd(interaction: discord.Interaction, enabled: bool, channel: 
 
 
 # ── UTILITY ───────────────────────────────────────────────────────────────────
-# ── MUSIC HELPERS & COMMANDS ──────────────────────────────────────────────────
-def get_music_queue(guild_id):
-    return music_queues.setdefault(guild_id, deque())
-
-
-def get_music_lock(guild_id):
-    lock = music_locks.get(guild_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        music_locks[guild_id] = lock
-    return lock
-
-
-def format_music_duration(seconds):
-    if not seconds:
-        return "Unknown"
-    seconds = int(seconds)
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{seconds:02d}"
-    return f"{minutes}:{seconds:02d}"
-
-
-def music_dependencies_error():
-    if yt_dlp is None:
-        return "`yt-dlp` is not installed. Add `yt-dlp[default,curl-cffi]` to your requirements file."
-    if not shutil.which("ffmpeg"):
-        return "FFmpeg is not installed or is not available on PATH."
-    return None
-
-
-def ytdlp_options():
-    options = {
-        "format": "bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "skip_download": True,
-        "source_address": "0.0.0.0",
-        "socket_timeout": 20,
-        "retries": 3,
-        "fragment_retries": 3,
-    }
-    if YTDLP_COOKIE_FILE:
-        options["cookiefile"] = YTDLP_COOKIE_FILE
-    return options
-
-
-async def search_music_track(search_text):
-    def extract():
-        target = search_text.strip()
-        if not re.match(r"^https?://", target, flags=re.IGNORECASE):
-            target = f"ytsearch1:{target}"
-        with yt_dlp.YoutubeDL(ytdlp_options()) as ydl:
-            result = ydl.extract_info(target, download=False)
-            if result and result.get("entries"):
-                result = next((entry for entry in result["entries"] if entry), None)
-            if not result:
-                raise RuntimeError("No matching track was found.")
-            return {
-                "title": result.get("title") or "Unknown title",
-                "webpage_url": result.get("webpage_url") or result.get("original_url") or result.get("url"),
-                "duration": result.get("duration"),
-                "thumbnail": result.get("thumbnail"),
-                "uploader": result.get("uploader") or result.get("channel") or "Unknown artist/channel",
-                "is_live": bool(result.get("is_live") or result.get("live_status") == "is_live"),
-            }
-
-    return await asyncio.to_thread(extract)
-
-
-async def resolve_music_stream(webpage_url):
-    def extract():
-        with yt_dlp.YoutubeDL(ytdlp_options()) as ydl:
-            result = ydl.extract_info(webpage_url, download=False)
-            if result and result.get("entries"):
-                result = next((entry for entry in result["entries"] if entry), None)
-            if not result or not result.get("url"):
-                raise RuntimeError("No playable audio stream was returned.")
-            return result["url"]
-
-    return await asyncio.to_thread(extract)
-
-
-def cancel_music_idle_task(guild_id):
-    task = music_idle_tasks.pop(guild_id, None)
-    if task and not task.done():
-        task.cancel()
-
-
-async def music_idle_disconnect(guild_id):
-    try:
-        await asyncio.sleep(MUSIC_IDLE_TIMEOUT_SECONDS)
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            return
-        voice_client = guild.voice_client
-        if (
-            voice_client
-            and voice_client.is_connected()
-            and not voice_client.is_playing()
-            and not voice_client.is_paused()
-            and not get_music_queue(guild_id)
-            and guild_id not in music_current
-        ):
-            await voice_client.disconnect(force=True)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        music_idle_tasks.pop(guild_id, None)
-
-
-def schedule_music_idle_disconnect(guild_id):
-    cancel_music_idle_task(guild_id)
-    music_idle_tasks[guild_id] = asyncio.create_task(music_idle_disconnect(guild_id))
-
-
-async def music_track_finished(guild_id, error=None):
-    guild = bot.get_guild(guild_id)
-    track = music_current.pop(guild_id, None)
-    if error and guild and track:
-        channel = guild.get_channel(track.get("text_channel_id"))
-        if channel:
-            try:
-                await channel.send(f"Music playback error: `{error}`")
-            except discord.HTTPException:
-                pass
-    if guild:
-        await start_next_music_track(guild)
-
-
-async def start_next_music_track(guild):
-    guild_id = guild.id
-    lock = get_music_lock(guild_id)
-
-    async with lock:
-        voice_client = guild.voice_client
-        if not voice_client or not voice_client.is_connected():
-            music_current.pop(guild_id, None)
-            get_music_queue(guild_id).clear()
-            music_starting.discard(guild_id)
-            return
-        if voice_client.is_playing() or voice_client.is_paused() or guild_id in music_starting:
-            return
-
-        queue = get_music_queue(guild_id)
-        if not queue:
-            music_current.pop(guild_id, None)
-            schedule_music_idle_disconnect(guild_id)
-            return
-
-        cancel_music_idle_task(guild_id)
-        track = queue.popleft()
-        music_current[guild_id] = track
-        music_starting.add(guild_id)
-
-    channel = guild.get_channel(track.get("text_channel_id"))
-    try:
-        stream_url = await resolve_music_stream(track["webpage_url"])
-        voice_client = guild.voice_client
-
-        async with lock:
-            if (
-                music_current.get(guild_id) is not track
-                or not voice_client
-                or not voice_client.is_connected()
-            ):
-                music_starting.discard(guild_id)
-                return
-
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(
-                    stream_url,
-                    before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-                    options="-vn -loglevel warning",
-                ),
-                volume=MUSIC_VOLUME,
-            )
-
-            def after_playback(playback_error):
-                asyncio.run_coroutine_threadsafe(
-                    music_track_finished(guild_id, playback_error),
-                    bot.loop,
-                )
-
-            voice_client.play(source, after=after_playback)
-            music_starting.discard(guild_id)
-
-        if channel:
-            embed = discord.Embed(
-                title="Now Playing",
-                description=f"[{track['title']}]({track['webpage_url']})",
-                color=JET2_RED,
-                timestamp=now(),
-            )
-            embed.add_field(name="Artist / Channel", value=track["uploader"], inline=True)
-            embed.add_field(name="Duration", value=format_music_duration(track.get("duration")), inline=True)
-            embed.add_field(name="Requested by", value=f"<@{track['requester_id']}>", inline=True)
-            if track.get("thumbnail"):
-                embed.set_thumbnail(url=track["thumbnail"])
-            embed.set_footer(text="Jet2.rblx Music | /skip to skip")
-            await channel.send(embed=embed)
-
-    except Exception as ex:
-        async with lock:
-            music_starting.discard(guild_id)
-            if music_current.get(guild_id) is track:
-                music_current.pop(guild_id, None)
-        if channel:
-            await channel.send(f"I could not play **{track['title']}**: `{str(ex)[:300]}`")
-        await start_next_music_track(guild)
-
-
-def member_in_bot_voice_channel(member, voice_client):
-    return bool(
-        member
-        and member.voice
-        and member.voice.channel
-        and voice_client
-        and voice_client.channel
-        and member.voice.channel.id == voice_client.channel.id
-    )
-
-
-@bot.command(name="acceptmusicrules")
-async def accept_music_rules_cmd(ctx):
-    if not ctx.guild:
-        await ctx.send("Use this command inside the Jet2.rblx server.")
-        return
-
-    already_accepted = ctx.author.id in music_rules_accepted
-    music_rules_accepted.add(ctx.author.id)
-    save_data()
-
-    embed = discord.Embed(
-        title="Jet2.rblx Music Rules",
-        description=MUSIC_RULES_TEXT,
-        color=JET2_RED,
-    )
-    if already_accepted:
-        embed.add_field(name="Status", value="You had already accepted these rules.", inline=False)
-    else:
-        embed.add_field(name="Status", value="Accepted. You can now join a voice channel and use `/play`.", inline=False)
-    embed.set_footer(text="Your acceptance is saved until an owner removes it from the bot data.")
-    await ctx.send(embed=embed)
-
-
-@tree.command(name="play", description="Search for and play music in your voice channel", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(search="Song name, artist or supported video URL")
-async def play_music_cmd(interaction: discord.Interaction, search: str):
-    await interaction.response.defer()
-
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.followup.send("This command can only be used in the server.", ephemeral=True)
-        return
-    if interaction.user.id not in music_rules_accepted:
-        await interaction.followup.send(
-            "You must accept the music rules first. Type `!acceptmusicrules` in a server text channel, then use `/play` again.",
-            ephemeral=True,
-        )
-        return
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.followup.send("Join a voice channel before using `/play`.", ephemeral=True)
-        return
-
-    dependency_error = music_dependencies_error()
-    if dependency_error:
-        await interaction.followup.send(dependency_error, ephemeral=True)
-        return
-
-    guild = interaction.guild
-    requested_channel = interaction.user.voice.channel
-    voice_client = guild.voice_client
-
-    if voice_client and voice_client.is_connected() and voice_client.channel.id != requested_channel.id:
-        await interaction.followup.send(
-            f"I am already playing music in {voice_client.channel.mention}. Join that voice channel to add songs.",
-            ephemeral=True,
-        )
-        return
-
-    if not voice_client or not voice_client.is_connected():
-        try:
-            voice_client = await requested_channel.connect(self_deaf=True)
-        except Exception as ex:
-            await interaction.followup.send(
-                f"I could not join your voice channel. Check Connect/Speak permissions and PyNaCl. Error: `{str(ex)[:250]}`",
-                ephemeral=True,
-            )
-            return
-
-    queue = get_music_queue(guild.id)
-    if len(queue) >= MUSIC_MAX_QUEUE_LENGTH:
-        await interaction.followup.send(
-            f"The music queue is full ({MUSIC_MAX_QUEUE_LENGTH} waiting tracks).",
-            ephemeral=True,
-        )
-        return
-
-    try:
-        track = await search_music_track(search)
-    except Exception as ex:
-        await interaction.followup.send(f"I could not find that track: `{str(ex)[:300]}`", ephemeral=True)
-        return
-
-    if track.get("is_live"):
-        await interaction.followup.send("Live streams are not allowed in the music system.", ephemeral=True)
-        return
-    duration = track.get("duration")
-    if duration and duration > MUSIC_MAX_DURATION_SECONDS:
-        await interaction.followup.send(
-            f"That track is too long. The limit is {format_music_duration(MUSIC_MAX_DURATION_SECONDS)}.",
-            ephemeral=True,
-        )
-        return
-
-    track.update({
-        "requester_id": interaction.user.id,
-        "requester_name": interaction.user.display_name,
-        "text_channel_id": interaction.channel_id,
-    })
-    queue.append(track)
-    queue_position = len(queue)
-
-    await interaction.followup.send(
-        f"Added **{track['title']}** to the music queue. Queue position: **{queue_position}**."
-    )
-    await start_next_music_track(guild)
-
-
-@tree.command(name="skip", description="Skip the current music track", guild=discord.Object(id=GUILD_ID))
-async def skip_music_cmd(interaction: discord.Interaction):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("This command can only be used in the server.", ephemeral=True)
-        return
-
-    voice_client = interaction.guild.voice_client
-    track = music_current.get(interaction.guild.id)
-    if not voice_client or not voice_client.is_connected() or not track:
-        await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
-        return
-    if not member_in_bot_voice_channel(interaction.user, voice_client):
-        await interaction.response.send_message("Join my voice channel before using `/skip`.", ephemeral=True)
-        return
-
-    can_skip = (
-        interaction.user.id == track.get("requester_id")
-        or is_support_staff(interaction.user)
-        or is_server_owner(interaction.user)
-    )
-    if not can_skip:
-        await interaction.response.send_message(
-            "Only the person who requested this track or Level 3+ staff can skip it.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.send_message(f"Skipped **{track['title']}**.")
-    voice_client.stop()
-
-
-@tree.command(name="stopmusic", description="Stop music, clear the queue and disconnect the bot", guild=discord.Object(id=GUILD_ID))
-async def stop_music_cmd(interaction: discord.Interaction):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("This command can only be used in the server.", ephemeral=True)
-        return
-    if not is_support_staff(interaction.user) and not is_server_owner(interaction.user):
-        await interaction.response.send_message("Level 3+ staff only.", ephemeral=True)
-        return
-
-    voice_client = interaction.guild.voice_client
-    if not voice_client or not voice_client.is_connected():
-        await interaction.response.send_message("I am not connected to a voice channel.", ephemeral=True)
-        return
-    if not is_server_owner(interaction.user) and not member_in_bot_voice_channel(interaction.user, voice_client):
-        await interaction.response.send_message("Join my voice channel before stopping the music.", ephemeral=True)
-        return
-
-    guild_id = interaction.guild.id
-    cancel_music_idle_task(guild_id)
-    get_music_queue(guild_id).clear()
-    music_current.pop(guild_id, None)
-    music_starting.discard(guild_id)
-
-    if voice_client.is_playing() or voice_client.is_paused():
-        voice_client.stop()
-    await voice_client.disconnect(force=True)
-    await interaction.response.send_message("Music stopped, the queue was cleared and I disconnected.")
-
-
 @tree.command(name="membercount", description="View the current server member count", guild=discord.Object(id=GUILD_ID))
 async def membercount(interaction: discord.Interaction):
     guild = bot.get_guild(GUILD_ID)
@@ -4212,10 +4788,9 @@ async def update_cmd(interaction: discord.Interaction):
     e = discord.Embed(title="Jet2.rblx Digital Assistant — Features & Commands", color=JET2_RED, timestamp=now())
     e.add_field(name="🎫 Ticket System", value="`/connected` `/unconnected` `/close` `/closeall` `/forceopen` `/onhold` `/ticketrename` `/ticketnote` `/tickettransfer` `/ticketpriority` `/ticketban` `/ticketunban` `/ticketstats` `/ticketsummary` `/requeststaff` `/anonreply` `/aideal` `/supporttickets` `/snippet` `/snippetadd` `/snippetlist` `/snippetdelete` `/careers` `/say` `/pingstaff` `/ticketchannel`", inline=False)
     e.add_field(name="🛡️ Moderation", value="`/warn` `/warnings` `/clearwarnings` `/timeout` `/untimeout` `/kick` `/ban` `/unban` `/softban` `/purge` `/slowmode` `/nick` `/usernick` `/role` `/roleemoji` `/massrole` `/lockdown` `/unlockdown` `/strike` `/clearstrikes` `/fire` `/modunlock` `/note` `/viewnotes` `/modhistory` `/logs` `/warndm` `/dm` `/allow` `/blacklist` `/unblacklist` `/viewblacklist`", inline=False)
-    e.add_field(name="✈️ Flight System", value="`/createflight` `/flight` `/attended` `/assign` `/reassign` `/report` `/assigned` `/flightcancel` `/flightupdate`", inline=False)
+    e.add_field(name="✈️ Flight System", value="`/createflight` `/shortcut assign` `/flightupdate` `/flightended` `/attended` `/assign` `/reassign` `/report` `/assigned` `/flightcancel`", inline=False)
     e.add_field(name="📢 Announcements", value="`/announce` `/announcechannel` `/channelembed` `/notifydm` `/announcedm` `/embed`\nAll use popup modals — formatting is preserved exactly as you type it.", inline=False)
     e.add_field(name="🤖 AI System", value="`/ai` `/aiask` `/aistatus` `/ai_toggle` `/ai_ticket_toggle` `/ai_preset_add` `/ai_preset_remove` `/aideal` `/ticketsummary`", inline=False)
-    e.add_field(name="🎵 Music System", value="Type `!acceptmusicrules` once, join a voice channel, then use `/play`. Use `/skip` to skip your own request; Level 3+ staff can use `/stopmusic` to clear the queue and disconnect the bot.", inline=False)
     e.add_field(name="⚙️ Config & Utility", value="`/config` `/roleupdate` `/welcome enable/disable` `/readonly` `/ticketchannel` `/allow` `/resetraids`\n`/membercount` `/serverinfo` `/botstatus` `/stafflist` `/onlinestaff` `/userinfo` `/staffinfo` `/viewtickets` `/remind`\n`/commands` `/update`", inline=False)
     e.set_footer(text="Jet2.rblx Digital Assistant — Full Feature List")
     await interaction.followup.send(embed=e, ephemeral=True)
@@ -4228,7 +4803,6 @@ async def update_cmd(interaction: discord.Interaction):
     app_commands.Choice(name="Flight",        value="flight"),
     app_commands.Choice(name="Announcements", value="announcements"),
     app_commands.Choice(name="AI",            value="ai"),
-    app_commands.Choice(name="Music",         value="music"),
     app_commands.Choice(name="General",       value="general"),
     app_commands.Choice(name="All",           value="all"),
 ])
@@ -4269,13 +4843,6 @@ async def commands_cmd(interaction: discord.Interaction, category: str = "all"):
         e.add_field(name="Level 2+", value="`/ai` — Start private AI session in DMs\n`/aiask` — Quick AI question", inline=False)
         if level >= 4: e.add_field(name="Level 4+", value="`/ticketsummary` — AI summary of current ticket\n`/aideal` — Hand ticket fully to AI\n`/aistatus` — Check AI status", inline=False)
         if level >= 5: e.add_field(name="Owner Only", value="`/ai_toggle` `/ai_ticket_toggle` `/ai_preset_add` `/ai_preset_remove`\nDM the bot directly to use AI to announce or message staff", inline=False)
-        embeds.append(e)
-
-    if category in ("music","all"):
-        e = discord.Embed(title="🎵 Music Commands", color=JET2_RED)
-        e.add_field(name="Everyone who accepts the rules", value="`!acceptmusicrules` — Accept the rules once\n`/play` — Search for and play a track\n`/skip` — Skip a track you requested", inline=False)
-        if level >= 3:
-            e.add_field(name="Level 3+", value="`/stopmusic` — Stop playback, clear the queue and disconnect the bot", inline=False)
         embeds.append(e)
 
     if category in ("general","all"):
