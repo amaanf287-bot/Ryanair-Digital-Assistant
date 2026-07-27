@@ -1,8 +1,5 @@
-discord.py[voice]
-yt-dlp
-spotipy
+discord.py
 groq
 python-dotenv
 aiohttp
 pytz
-PyNaCl
