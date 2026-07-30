@@ -125,6 +125,7 @@ applications = {}; anti_raid_removed_roles = {}
 inactivity_tasks_started = set(); processed_audit_entries = set()
 protected_guild_icon_bytes = None
 persistent_views_loaded = False
+slash_commands_synced = False
 
 # ── JET2.RBLX ROLE MODEL ──────────────────────────────────────────────────────
 # The bot uses these names as permission levels even before /config is run.
@@ -2720,6 +2721,53 @@ async def on_member_remove(member):
     await anti_raid_lock_actor(guild, actor, f"Unauthorised member {action_name}", f"{member} ({member.id})", restored)
 
 
+async def sync_jet2_slash_commands():
+    """Sync this bot's guild slash commands and verify application commands exist."""
+    guild_object = discord.Object(id=GUILD_ID)
+    synced = await tree.sync(guild=guild_object)
+    synced_names = {command.name for command in synced}
+
+    required_commands = {"apply", "application"}
+    missing_commands = sorted(required_commands - synced_names)
+    if missing_commands:
+        raise RuntimeError(
+            "Discord did not return the required command(s) after syncing: "
+            + ", ".join(f"/{name}" for name in missing_commands)
+        )
+
+    print(
+        f"Slash command sync complete — {len(synced)} commands. "
+        f"Verified: /apply and /application"
+    )
+    print("Synced slash commands: " + ", ".join(sorted(synced_names)))
+    return synced
+
+
+@bot.command(name="synccommands")
+@commands.guild_only()
+async def synccommands_prefix(ctx: commands.Context):
+    """Owner-only emergency command: !synccommands"""
+    global slash_commands_synced
+
+    if not is_server_owner(ctx.author):
+        await ctx.reply("Only the server owner can sync slash commands.", mention_author=False)
+        return
+
+    try:
+        synced = await sync_jet2_slash_commands()
+        slash_commands_synced = True
+        await ctx.reply(
+            f"Synced **{len(synced)}** slash commands. `/apply` and `/application` are registered.",
+            mention_author=False,
+        )
+    except Exception as error:
+        await ctx.reply(
+            f"Slash command sync failed: `{type(error).__name__}: {error}`",
+            mention_author=False,
+        )
+        raise
+
+
 # ── EVENTS ────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_command(ctx):
@@ -2733,7 +2781,22 @@ async def on_command(ctx):
 
 @bot.event
 async def on_ready():
-    global persistent_views_loaded, protected_guild_icon_bytes
+    global persistent_views_loaded, protected_guild_icon_bytes, slash_commands_synced
+
+    # Sync first so a damaged data.json cannot prevent new slash commands appearing.
+    if not slash_commands_synced:
+        try:
+            synced = await sync_jet2_slash_commands()
+            slash_commands_synced = True
+        except Exception as error:
+            print(
+                "SLASH COMMAND SYNC FAILED: "
+                f"{type(error).__name__}: {error}"
+            )
+            synced = []
+    else:
+        synced = tree.get_commands(guild=discord.Object(id=GUILD_ID))
+
     load_data()
     guild = bot.get_guild(GUILD_ID)
     if guild:
@@ -2755,8 +2818,11 @@ async def on_ready():
             if survey.get("invited_ids"):
                 bot.add_view(FlightFeedbackView(flight_id))
         persistent_views_loaded = True
-    synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
-    print(f"Jet2.rblx Digital Assistant online as {bot.user} — synced {len(synced)} commands")
+
+    print(
+        f"Jet2.rblx Digital Assistant online as {bot.user} "
+        f"— {len(synced)} guild commands loaded"
+    )
 
 @auto_bot.event
 async def on_ready():
@@ -4265,6 +4331,37 @@ class ApplicationStartView(discord.ui.View):
         await interaction.response.send_modal(
             ApplicationModal(self.target_user_id, self.application_type, self.sent_by_id)
         )
+
+
+@tree.command(
+    name="apply",
+    description="Open a Jet2.rblx staff application form",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(application_type="Department you want to apply for")
+@app_commands.choices(application_type=[
+    app_commands.Choice(name="Cabin Crew", value="cabin_crew"),
+    app_commands.Choice(name="Ground & Airport Operations", value="ground_airport"),
+    app_commands.Choice(name="Management", value="management"),
+    app_commands.Choice(name="Developer", value="developer"),
+])
+async def apply_cmd(interaction: discord.Interaction, application_type: str):
+    info = APPLICATION_QUESTIONS.get(application_type)
+    if not info:
+        await interaction.response.send_message(
+            "That application type is not available.",
+            ephemeral=True,
+        )
+        return
+
+    # A modal must be the first interaction response, so open it directly.
+    await interaction.response.send_modal(
+        ApplicationModal(
+            target_user_id=interaction.user.id,
+            application_type=application_type,
+            sent_by_id=interaction.user.id,
+        )
+    )
 
 
 @tree.command(name="application", description="Send a Jet2.rblx application form to a selected user (Customer Support Team+)", guild=discord.Object(id=GUILD_ID))
@@ -5915,7 +6012,7 @@ async def remind_cmd(interaction: discord.Interaction, minutes: int, message: st
 async def update_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     e = discord.Embed(title="Jet2.rblx Digital Assistant — Features & Commands", color=JET2_RED, timestamp=now())
-    e.add_field(name="🎫 Ticket System", value="`/connect` `/unconnected` `/closerequest` `/close` `/closeall` `/forceopen` `/onhold` `/ticketrename` `/ticketnote` `/tickettransfer` `/ticketpriority` `/ticketban` `/ticketunban` `/ticketstats` `/ticketsummary` `/requeststaff` `/anonreply` `/aideal` `/supporttickets` `/snippet` `/snippetadd` `/snippetlist` `/snippetdelete` `/careers` `/application` `/say` `/pingstaff` `/ticketchannel`", inline=False)
+    e.add_field(name="🎫 Ticket System", value="`/connect` `/unconnected` `/closerequest` `/close` `/closeall` `/forceopen` `/onhold` `/ticketrename` `/ticketnote` `/tickettransfer` `/ticketpriority` `/ticketban` `/ticketunban` `/ticketstats` `/ticketsummary` `/requeststaff` `/anonreply` `/aideal` `/supporttickets` `/snippet` `/snippetadd` `/snippetlist` `/snippetdelete` `/careers` `/apply` `/application` `/say` `/pingstaff` `/ticketchannel`", inline=False)
     e.add_field(name="🛡️ Moderation", value="`/warn` `/warnings` `/clearwarnings` `/timeout` `/untimeout` `/kick` `/ban` `/unban` `/softban` `/purge` `/slowmode` `/nick` `/usernick` `/role` `/roleemoji` `/massrole` `/lockdown` `/unlockdown` `/strike` `/clearstrikes` `/fire` `/modunlock` `/note` `/viewnotes` `/modhistory` `/logs` `/warndm` `/dm` `/allow` `/blacklist` `/unblacklist` `/viewblacklist`", inline=False)
     e.add_field(name="✈️ Flight System", value="`/paxflight` `/createflight` `/shortcut assign` `/flightupdate` `/flightended` `/attended` `/assign` `/reassign` `/report` `/assigned` `/flightcancel`", inline=False)
     e.add_field(name="📢 Announcements", value="`/announce` `/announcechannel` `/channelembed` `/notifydm` `/announcedm` `/embed`\nAll use popup modals — formatting is preserved exactly as you type it.", inline=False)
@@ -5943,7 +6040,7 @@ async def commands_cmd(interaction: discord.Interaction, category: str = "all"):
 
     if category in ("tickets","all") and level >= 3:
         e = discord.Embed(title="🎫 Ticket Commands", color=JET2_RED)
-        e.add_field(name="Customer Support Team (Level 3+)", value="`/connect` `/unconnected` `/closerequest` `/close` `/onhold` `/anonreply` `/say` `/snippet` `/snippetlist` `/ticketnote` `/ticketstats` `/ticketsummary` `/aideal` `/requeststaff` `/supporttickets` `/careers` `/application`", inline=False)
+        e.add_field(name="Customer Support Team (Level 3+)", value="`/connect` `/unconnected` `/closerequest` `/close` `/onhold` `/anonreply` `/say` `/snippet` `/snippetlist` `/ticketnote` `/ticketstats` `/ticketsummary` `/aideal` `/requeststaff` `/supporttickets` `/careers` `/apply` `/application`", inline=False)
         if level >= 4: e.add_field(name="Directors / Executives (Level 4+)", value="`/forceopen` `/ticketrename` `/tickettransfer` `/ticketpriority` `/ticketban` `/ticketunban` `/snippetadd` `/snippetdelete` `/pingstaff`", inline=False)
         if level >= 5: e.add_field(name="Owner Only", value="`/closeall` `/ticketchannel` `/info`", inline=False)
         embeds.append(e)
