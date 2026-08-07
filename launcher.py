@@ -4,6 +4,8 @@ import traceback
 
 import discord
 
+print("RYANAIR LAUNCHER v3 — pre-import Railway validation enabled", flush=True)
+
 
 def _normalise_numeric_env(name: str, default: str | None = None) -> None:
     """Prevent placeholder text in Railway numeric variables from crashing import."""
