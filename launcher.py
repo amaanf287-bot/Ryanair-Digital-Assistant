@@ -4,7 +4,7 @@ import traceback
 
 import discord
 
-print("RYANAIR LAUNCHER v3 — pre-import Railway validation enabled", flush=True)
+print("RYANAIR LAUNCHER v4 — Railway validation + music system", flush=True)
 
 
 def _normalise_numeric_env(name: str, default: str | None = None) -> None:
@@ -29,10 +29,6 @@ def _normalise_numeric_env(name: str, default: str | None = None) -> None:
         )
 
 
-# bot.py converts these variables to integers while it is imported. Railway
-# variables sometimes contain instruction/placeholder text such as
-# RYLANS_DISCORD_USER_ID. Sanitise them before importing bot.py so one optional
-# setting cannot crash the entire worker.
 _numeric_defaults = {
     "GUILD_ID": "0",
     "TICKET_CATEGORY_ID": "0",
@@ -47,36 +43,35 @@ _numeric_defaults = {
 for _name, _default in _numeric_defaults.items():
     _normalise_numeric_env(_name, _default)
 
-# DEPARTURES_CHANNEL_ID is optional; if it is absent bot.py falls back to the
-# announcement channel. Only correct it when Railway contains an invalid value.
 if os.getenv("DEPARTURES_CHANNEL_ID"):
     _normalise_numeric_env("DEPARTURES_CHANNEL_ID", "0")
 
 import bot as app
 
+# Music is deliberately loaded as an optional module. A future music dependency
+# problem will be logged without taking the three existing Discord clients down.
+try:
+    import music_system
+    music_system.setup(app.bot, app.groq_client)
+    print("Music module ready.", flush=True)
+except Exception as exc:
+    print(f"MUSIC MODULE ERROR — {type(exc).__name__}: {exc}", flush=True)
+    traceback.print_exc()
 
-async def start_client(name: str, client: discord.Client, token: str) -> None:
+
+async def start_client(label: str, client: discord.Client, token: str) -> None:
     """Start one Discord client without allowing it to cancel the others."""
     try:
-        print(f"Starting {name}...", flush=True)
+        print(f"Starting {label}...", flush=True)
         await client.start(token, reconnect=True)
     except discord.LoginFailure:
-        print(
-            f"STARTUP ERROR — {name}: Discord rejected this bot token.",
-            flush=True,
-        )
+        print(f"STARTUP ERROR — {label}: Discord rejected this bot token.", flush=True)
     except discord.PrivilegedIntentsRequired as error:
-        print(
-            f"STARTUP ERROR — {name}: privileged intents are disabled: {error}",
-            flush=True,
-        )
+        print(f"STARTUP ERROR — {label}: privileged intents are disabled: {error}", flush=True)
     except asyncio.CancelledError:
         raise
     except Exception as error:
-        print(
-            f"STARTUP ERROR — {name}: {type(error).__name__}: {error}",
-            flush=True,
-        )
+        print(f"STARTUP ERROR — {label}: {type(error).__name__}: {error}", flush=True)
         traceback.print_exc()
 
 
@@ -84,50 +79,31 @@ async def main() -> None:
     if not app.TOKEN:
         raise RuntimeError("DISCORD_TOKEN is missing from Railway variables.")
 
-    configured_clients = [
-        ("Ryanair Digital Assistant", app.bot, app.TOKEN),
-    ]
+    # These are neutral startup labels only. Renaming the bots in Discord does
+    # not require any code change and does not alter their tokens.
+    configured_clients = [("Primary Discord bot", app.bot, app.TOKEN)]
 
     if app.AUTOMATION_TOKEN:
         if app.AUTOMATION_TOKEN == app.TOKEN:
-            print(
-                "AUTOMATION_TOKEN matches DISCORD_TOKEN; duplicate login skipped.",
-                flush=True,
-            )
+            print("AUTOMATION_TOKEN matches DISCORD_TOKEN; duplicate login skipped.", flush=True)
         else:
-            configured_clients.append(
-                ("Automation bot", app.auto_bot, app.AUTOMATION_TOKEN)
-            )
+            configured_clients.append(("Automation Discord bot", app.auto_bot, app.AUTOMATION_TOKEN))
     else:
         print("AUTOMATION_TOKEN is missing; Automation bot skipped.", flush=True)
 
     if app.RYANAIR_FLIGHT_TOKEN:
         if app.RYANAIR_FLIGHT_TOKEN in {app.TOKEN, app.AUTOMATION_TOKEN}:
-            print(
-                "RYANAIR_FLIGHT_TOKEN matches another token; duplicate login skipped.",
-                flush=True,
-            )
+            print("RYANAIR_FLIGHT_TOKEN matches another token; duplicate login skipped.", flush=True)
         else:
-            configured_clients.append(
-                (
-                    "Ryanair Flight Operations bot",
-                    app.ryanair_flight_bot,
-                    app.RYANAIR_FLIGHT_TOKEN,
-                )
-            )
+            configured_clients.append(("Flight Discord bot", app.ryanair_flight_bot, app.RYANAIR_FLIGHT_TOKEN))
     else:
-        print(
-            "RYANAIR_FLIGHT_TOKEN/JET2_FLIGHT_TOKEN is missing; Flight Operations bot skipped.",
-            flush=True,
-        )
+        print("RYANAIR_FLIGHT_TOKEN/JET2_FLIGHT_TOKEN is missing; Flight bot skipped.", flush=True)
 
     tasks = [
-        asyncio.create_task(start_client(name, client, token), name=name)
-        for name, client, token in configured_clients
+        asyncio.create_task(start_client(label, client, token), name=label)
+        for label, client, token in configured_clients
     ]
 
-    # Each client is isolated: one bad token or gateway configuration will no
-    # longer cancel the other running Discord clients.
     await asyncio.gather(*tasks)
     raise RuntimeError("All configured Discord clients stopped.")
 
