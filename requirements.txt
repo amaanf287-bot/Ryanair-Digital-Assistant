@@ -3,3 +3,6 @@ groq
 python-dotenv
 aiohttp
 pytz
+PyNaCl
+yt-dlp
+imageio-ffmpeg
