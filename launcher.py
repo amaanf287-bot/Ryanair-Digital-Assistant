@@ -4,7 +4,7 @@ import traceback
 
 import discord
 
-print("RYANAIR LAUNCHER v4 — Railway validation + music system", flush=True)
+print("RYANAIR LAUNCHER v5 — Railway validation + music + role extensions", flush=True)
 
 
 def _normalise_numeric_env(name: str, default: str | None = None) -> None:
@@ -48,6 +48,15 @@ if os.getenv("DEPARTURES_CHANNEL_ID"):
 
 import bot as app
 
+# Extend the existing role hierarchy without changing the stable bot.py command code.
+try:
+    import role_extension
+    role_extension.setup(app)
+    print("Role extension ready.", flush=True)
+except Exception as exc:
+    print(f"ROLE EXTENSION ERROR — {type(exc).__name__}: {exc}", flush=True)
+    traceback.print_exc()
+
 # Music is deliberately loaded as an optional module. A future music dependency
 # problem will be logged without taking the three existing Discord clients down.
 try:
@@ -79,8 +88,7 @@ async def main() -> None:
     if not app.TOKEN:
         raise RuntimeError("DISCORD_TOKEN is missing from Railway variables.")
 
-    # These are neutral startup labels only. Renaming the bots in Discord does
-    # not require any code change and does not alter their tokens.
+    # Neutral labels only. Renaming the bots in Discord never requires a code change.
     configured_clients = [("Primary Discord bot", app.bot, app.TOKEN)]
 
     if app.AUTOMATION_TOKEN:
