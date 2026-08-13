@@ -5,8 +5,8 @@ def setup(app):
     import role_sync
     role_sync.setup(app)
 
-    import server_layout_v13
-    server_layout_v13.setup(app)
+    import server_layout_v14
+    server_layout_v14.setup(app)
 
     import log_channels
     log_channels.setup(app)
@@ -23,4 +23,7 @@ def setup(app):
     import server_export
     server_export.setup(app)
 
-    print("Ryanair server sync ready: layout V13 strict per-channel role locks loaded.", flush=True)
+    print(
+        "Ryanair server sync ready: layout V14 authoritative Information/Bulletin rank locks loaded.",
+        flush=True,
+    )
