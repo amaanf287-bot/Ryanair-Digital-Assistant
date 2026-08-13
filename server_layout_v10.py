@@ -1,7 +1,9 @@
-"""Ryanair Discord layout V10: non-destructive permission repair.
+"""Ryanair Discord layout V10: immediate + final permission repair.
 
-V10 keeps the V9 clean layout, but adds a final explicit rank-lock pass for
-public read-only/bulletin channels. It never deletes channels on startup.
+V10 keeps the V9 clean layout and applies rank/post locks in TWO places:
+1) immediately as each public channel is created/configured, before the builder
+   advances to the next channel;
+2) again on startup as a non-destructive final verification/repair pass.
 
 Public announcement/information channels remain visible to everyone; posting is
 explicitly denied to @everyone and granted only to the appropriate rank roles.
@@ -58,58 +60,125 @@ def publisher_overwrite():
     )
 
 
-async def enforce_public_post_locks(app, guild, errors):
-    """Force explicit posting locks on every managed public read-only channel."""
-    by_name = {channel.name.casefold(): channel for channel in guild.text_channels}
+async def apply_one_public_channel_now(app, channel, guild, read_only=False, errors=None):
+    """Fully permission one channel before the builder advances to the next."""
+    if errors is None:
+        errors = []
 
-    for channel_name in sorted(POST_LOCK_CHANNELS):
-        channel = by_name.get(channel_name)
-        if channel is None:
-            continue
+    name = channel.name.casefold()
 
+    if not read_only:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=True,
+                add_reactions=True,
+            )
+        }
+        if guild.me:
+            overwrites[guild.me] = layout.bot_overwrite()
+    else:
         overwrites = {
             guild.default_role: public_read_only_overwrite(),
         }
         if guild.me:
             overwrites[guild.me] = layout.bot_overwrite()
 
-        # Use the channel-specific publisher hierarchy already defined by V7.
-        for role_name in sorted(layout.public_publishers(app, channel_name)):
+        for role_name in sorted(layout.public_publishers(app, name)):
             found = role_named(guild, role_name)
             if found:
                 overwrites[found] = publisher_overwrite()
 
+    try:
+        await channel.edit(
+            overwrites=overwrites,
+            reason="Ryanair immediate channel permission/rank lock",
+        )
+    except TypeError:
         try:
-            await channel.edit(
-                overwrites=overwrites,
-                reason="Ryanair V10 explicit rank/post lock",
-            )
-        except TypeError:
-            # Compatibility fallback for discord.py variants.
-            try:
+            if read_only:
                 await channel.set_permissions(
                     guild.default_role,
                     overwrite=public_read_only_overwrite(),
-                    reason="Ryanair V10 @everyone post lock",
+                    reason="Ryanair immediate @everyone post lock",
                 )
                 if guild.me:
                     await channel.set_permissions(
                         guild.me,
                         overwrite=layout.bot_overwrite(),
-                        reason="Ryanair V10 bot access",
+                        reason="Ryanair immediate bot access",
                     )
-                for role_name in sorted(layout.public_publishers(app, channel_name)):
+                for role_name in sorted(layout.public_publishers(app, name)):
                     found = role_named(guild, role_name)
                     if found:
                         await channel.set_permissions(
                             found,
                             overwrite=publisher_overwrite(),
-                            reason="Ryanair V10 publisher rank access",
+                            reason="Ryanair immediate publisher rank access",
                         )
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                errors.append(f"{channel_name} lock fallback: {str(exc)[:120]}")
+            else:
+                await channel.set_permissions(
+                    guild.default_role,
+                    view_channel=True,
+                    read_message_history=True,
+                    send_messages=True,
+                    add_reactions=True,
+                    reason="Ryanair immediate public channel access",
+                )
+                if guild.me:
+                    await channel.set_permissions(
+                        guild.me,
+                        overwrite=layout.bot_overwrite(),
+                        reason="Ryanair immediate bot access",
+                    )
         except (discord.Forbidden, discord.HTTPException) as exc:
-            errors.append(f"{channel_name} lock: {str(exc)[:120]}")
+            errors.append(f"{name} immediate permissions fallback: {str(exc)[:120]}")
+            return
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        errors.append(f"{name} immediate permissions: {str(exc)[:120]}")
+        return
+
+    # For rank/post-locked channels, do not continue until the critical
+    # @everyone Send Messages deny is present on this channel object.
+    if read_only:
+        try:
+            current = channel.overwrites_for(guild.default_role)
+            if current.send_messages is not False:
+                await asyncio.sleep(0.15)
+                refreshed = guild.get_channel(channel.id)
+                if refreshed is not None:
+                    current = refreshed.overwrites_for(guild.default_role)
+            if current.send_messages is not False:
+                errors.append(
+                    f"{name} verification: @everyone Send Messages was not explicitly OFF"
+                )
+        except Exception as exc:
+            errors.append(
+                f"{name} verification: {type(exc).__name__}: {str(exc)[:100]}"
+            )
+
+
+async def immediate_set_public_channel(app, channel, guild, *, read_only=False):
+    """Replacement used by V7 build_public: create -> lock -> next."""
+    errors = []
+    await apply_one_public_channel_now(app, channel, guild, read_only, errors)
+    if errors:
+        print(
+            "IMMEDIATE CHANNEL LOCK ISSUE: " + " | ".join(errors[:3]),
+            flush=True,
+        )
+
+
+async def enforce_public_post_locks(app, guild, errors):
+    """Final backup pass for every managed public read-only channel."""
+    by_name = {channel.name.casefold(): channel for channel in guild.text_channels}
+
+    for channel_name in sorted(POST_LOCK_CHANNELS):
+        channel = by_name.get(channel_name)
+        if channel is None:
+            continue
+        await apply_one_public_channel_now(app, channel, guild, True, errors)
 
 
 async def enforce_private_operational_locks(app, guild, errors):
@@ -159,13 +228,19 @@ def setup(app):
         return
     app._professional_layout_v10_loaded = True
 
+    # IMPORTANT: V7 build_public calls layout.set_public_channel immediately
+    # after every ensure_text(). Replace that function BEFORE V9 is loaded so
+    # every channel receives its strict permission/rank lock before the loop
+    # advances to the next channel.
+    layout.set_public_channel = immediate_set_public_channel
+
     # Keep V9's explicit owner-only /setupserver clean rebuild available.
-    # Patch the V9 builder so any future deliberate rebuild receives the V10
-    # permission pass before it reports completion.
+    # Its builder uses V7 build_public, which now has the immediate lock hook.
     original_build_clean_layout = v9.build_clean_layout
 
     async def build_clean_layout_v10(app_obj, guild):
         made, errors = await original_build_clean_layout(app_obj, guild)
+        # Final backup verification after the sequential per-channel locks.
         errors.extend(await repair_rank_locks(app_obj, guild))
         return made, errors
 
@@ -187,6 +262,6 @@ def setup(app):
 
     app.bot.add_listener(on_ready_v10, "on_ready")
     print(
-        "Professional server layout V10 loaded: explicit bulletin post locks + private operational locks.",
+        "Professional server layout V10 loaded: each channel is locked before the builder creates the next one.",
         flush=True,
     )
