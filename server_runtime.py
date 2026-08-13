@@ -9,6 +9,10 @@ def setup(app):
     import server_layout_v2
     server_layout_v2.setup(app)
 
+    # Keep rebuilt log channels separated and resolve their IDs automatically.
+    import log_channels
+    log_channels.setup(app)
+
     import emoji_sync
     emoji_sync.setup(app)
 
@@ -24,4 +28,4 @@ def setup(app):
     import server_export
     server_export.setup(app)
 
-    print("Ryanair server sync ready: professional layout V2, roles, emojis, community forms, AI handoff and exporter.", flush=True)
+    print("Ryanair server sync ready: professional layout V2, roles, dedicated logs, emojis, community forms, AI handoff and exporter.", flush=True)
