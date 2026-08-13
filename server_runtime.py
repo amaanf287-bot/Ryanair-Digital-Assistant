@@ -5,8 +5,8 @@ def setup(app):
     import role_sync
     role_sync.setup(app)
 
-    import server_layout_v3
-    server_layout_v3.setup(app)
+    import server_layout_v4
+    server_layout_v4.setup(app)
 
     import log_channels
     log_channels.setup(app)
@@ -24,4 +24,4 @@ def setup(app):
     import server_export
     server_export.setup(app)
 
-    print("Ryanair server sync ready: layout V3 recovery, roles, logs, emojis, forms, AI handoff and exporter.", flush=True)
+    print("Ryanair server sync ready: layout V4 recovery, roles, logs, emojis, forms, AI handoff and exporter.", flush=True)
