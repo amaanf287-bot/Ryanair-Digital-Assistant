@@ -6,8 +6,8 @@ def setup(app):
     role_sync.setup(app)
 
     # Full professional channel/category rebuild and rank locks.
-    import server_layout
-    server_layout.setup(app)
+    import server_layout_v2
+    server_layout_v2.setup(app)
 
     import emoji_sync
     emoji_sync.setup(app)
@@ -24,4 +24,4 @@ def setup(app):
     import server_export
     server_export.setup(app)
 
-    print("Ryanair server sync ready: professional layout, roles, emojis, community forms, AI handoff and exporter.", flush=True)
+    print("Ryanair server sync ready: professional layout V2, roles, emojis, community forms, AI handoff and exporter.", flush=True)
