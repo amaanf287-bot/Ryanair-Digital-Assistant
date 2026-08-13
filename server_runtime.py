@@ -16,4 +16,8 @@ def setup(app):
     import aideal_toggle
     aideal_toggle.setup(app)
 
-    print("Ryanair server sync ready: roles, emojis, community forms and AI handoff.", flush=True)
+    # Reference Discord server structure exporter.
+    import server_export
+    server_export.setup(app)
+
+    print("Ryanair server sync ready: roles, emojis, community forms, AI handoff and server exporter.", flush=True)
