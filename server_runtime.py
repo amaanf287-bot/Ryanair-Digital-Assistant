@@ -5,8 +5,8 @@ def setup(app):
     import role_sync
     role_sync.setup(app)
 
-    import server_layout_v5
-    server_layout_v5.setup(app)
+    import server_layout_v6
+    server_layout_v6.setup(app)
 
     import log_channels
     log_channels.setup(app)
@@ -24,4 +24,4 @@ def setup(app):
     import server_export
     server_export.setup(app)
 
-    print("Ryanair server sync ready: layout V5 announcement channels, strict rank locks, roles, logs, emojis, forms, AI handoff and exporter.", flush=True)
+    print("Ryanair server sync ready: layout V6 single Staff Hub, Announcement channels, rank locks, roles, logs, emojis, forms, AI handoff and exporter.", flush=True)
