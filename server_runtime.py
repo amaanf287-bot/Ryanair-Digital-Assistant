@@ -12,4 +12,8 @@ def setup(app):
     import application_commands
     application_commands.setup(app)
 
-    print("Ryanair server sync ready: roles, emojis and community forms.", flush=True)
+    # Per-ticket AI/human handoff toggle.
+    import aideal_toggle
+    aideal_toggle.setup(app)
+
+    print("Ryanair server sync ready: roles, emojis, community forms and AI handoff.", flush=True)
