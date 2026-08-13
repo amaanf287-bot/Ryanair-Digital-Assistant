@@ -5,11 +5,9 @@ def setup(app):
     import role_sync
     role_sync.setup(app)
 
-    # Full professional channel/category rebuild and rank locks.
-    import server_layout_v2
-    server_layout_v2.setup(app)
+    import server_layout_v3
+    server_layout_v3.setup(app)
 
-    # Keep rebuilt log channels separated and resolve their IDs automatically.
     import log_channels
     log_channels.setup(app)
 
@@ -20,12 +18,10 @@ def setup(app):
     import application_commands
     application_commands.setup(app)
 
-    # Per-ticket AI/human handoff toggle.
     import aideal_toggle
     aideal_toggle.setup(app)
 
-    # Reference Discord server structure exporter.
     import server_export
     server_export.setup(app)
 
-    print("Ryanair server sync ready: professional layout V2, roles, dedicated logs, emojis, community forms, AI handoff and exporter.", flush=True)
+    print("Ryanair server sync ready: layout V3 recovery, roles, logs, emojis, forms, AI handoff and exporter.", flush=True)
