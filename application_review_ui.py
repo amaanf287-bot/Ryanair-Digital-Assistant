@@ -35,9 +35,14 @@ class ReviewButton(discord.ui.Button):
 class ReviewView(discord.ui.View):
     def __init__(self, app, app_id):
         super().__init__(timeout=None)
-        self.add_item(ReviewButton(app, app_id, "pass", "Pass", discord.ButtonStyle.success, "✅"))
-        self.add_item(ReviewButton(app, app_id, "consider", "Consider", discord.ButtonStyle.secondary, "📄"))
-        self.add_item(ReviewButton(app, app_id, "fail", "Fail", discord.ButtonStyle.danger, "❌"))
+        guild = app.bot.get_guild(app.GUILD_ID)
+        resolver = getattr(app, "server_emoji", None)
+        tick = resolver(guild, "tick") if resolver else "✅"
+        document = resolver(guild, "document") if resolver else "📄"
+        cross = resolver(guild, "cross") if resolver else "❌"
+        self.add_item(ReviewButton(app, app_id, "pass", "Pass", discord.ButtonStyle.success, tick))
+        self.add_item(ReviewButton(app, app_id, "consider", "Consider", discord.ButtonStyle.secondary, document))
+        self.add_item(ReviewButton(app, app_id, "fail", "Fail", discord.ButtonStyle.danger, cross))
 
 
 async def send_review(app, app_id, record):
