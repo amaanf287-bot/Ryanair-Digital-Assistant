@@ -20,6 +20,9 @@ def setup(app):
     import application_commands
     application_commands.setup(app)
 
+    import channel_announcements
+    channel_announcements.setup(app)
+
     import aideal_toggle
     aideal_toggle.setup(app)
 
@@ -27,6 +30,6 @@ def setup(app):
     server_export.setup(app)
 
     print(
-        "Ryanair server sync ready: V17 website channel + website-only applications + ticket grammar system loaded.",
+        "Ryanair server sync ready: V17 website channel + website-only applications + ticket grammar system + channel announcements loaded.",
         flush=True,
     )
