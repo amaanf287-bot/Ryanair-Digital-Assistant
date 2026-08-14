@@ -4,7 +4,7 @@ import traceback
 
 import discord
 
-print("RYANAIR LAUNCHER v6 — Ryanair runtime + reliable music commands", flush=True)
+print("RYANAIR LAUNCHER v7 — early slash-command repair + Ryanair runtime", flush=True)
 
 
 def _normalise_numeric_env(name: str, default: str | None = None) -> None:
@@ -47,6 +47,27 @@ if os.getenv("DEPARTURES_CHANNEL_ID"):
     _normalise_numeric_env("DEPARTURES_CHANNEL_ID", "0")
 
 import bot as app
+
+# Load the command-slot replacement independently of the larger runtime chain.
+# This guarantees /massrole is removed and /channel annoucments is registered
+# before the bot connects, even if a later server integration has an error.
+try:
+    import command_slot_swap
+    command_slot_swap.setup(app)
+
+    import channel_announcements
+    channel_announcements.setup(app)
+
+    import slash_command_repair
+    slash_command_repair.setup(app)
+
+    print(
+        "EARLY SLASH REPAIR READY — /massrole removed locally; /channel annoucments registered before login.",
+        flush=True,
+    )
+except Exception as exc:
+    print(f"EARLY SLASH REPAIR ERROR — {type(exc).__name__}: {exc}", flush=True)
+    traceback.print_exc()
 
 # Apply the live Ryanair-only hierarchy and branding before commands are used.
 try:
