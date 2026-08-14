@@ -20,6 +20,9 @@ def setup(app):
     import application_commands
     application_commands.setup(app)
 
+    import command_slot_swap
+    command_slot_swap.setup(app)
+
     import channel_announcements
     channel_announcements.setup(app)
 
@@ -30,6 +33,6 @@ def setup(app):
     server_export.setup(app)
 
     print(
-        "Ryanair server sync ready: V17 website channel + website-only applications + ticket grammar system + channel announcements loaded.",
+        "Ryanair server sync ready: V17 website channel + website-only applications + ticket grammar system + /channel announcements loaded; /massrole removed.",
         flush=True,
     )
