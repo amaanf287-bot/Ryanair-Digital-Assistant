@@ -26,6 +26,9 @@ def setup(app):
     import channel_announcements
     channel_announcements.setup(app)
 
+    import slash_command_repair
+    slash_command_repair.setup(app)
+
     import aideal_toggle
     aideal_toggle.setup(app)
 
@@ -33,6 +36,6 @@ def setup(app):
     server_export.setup(app)
 
     print(
-        "Ryanair server sync ready: V17 website channel + website-only applications + ticket grammar system + /channel announcements loaded; /massrole removed.",
+        "Ryanair server sync ready: V17 + ticket grammar + /channel announcements; remote /massrole purge verification loaded.",
         flush=True,
     )
