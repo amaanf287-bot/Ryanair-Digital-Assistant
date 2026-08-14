@@ -5,8 +5,8 @@ def setup(app):
     import role_sync
     role_sync.setup(app)
 
-    import server_layout_v16
-    server_layout_v16.setup(app)
+    import server_layout_v17
+    server_layout_v17.setup(app)
 
     import ticket_grammar_access
     ticket_grammar_access.setup(app)
@@ -27,6 +27,6 @@ def setup(app):
     server_export.setup(app)
 
     print(
-        "Ryanair server sync ready: V16 public rank locks + department ticket access + weekly grammar qualification loaded.",
+        "Ryanair server sync ready: V17 website channel + website-only applications + ticket grammar system loaded.",
         flush=True,
     )
