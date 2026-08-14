@@ -197,18 +197,15 @@ def find_role(guild, name):
 def ticket_overwrites(app, guild, channel, category_name):
     overwrites = {guild.default_role: hidden()}
 
-    # Bot always retains operational access.
     if guild.me:
         overwrites[guild.me] = layout.bot_overwrite()
 
-    # Executives can always view and speak; they never take grammar tests.
     for role_name in sorted(EXECUTIVES):
         role = find_role(guild, role_name)
         if role:
             overwrites[role] = writer()
 
-    # Staff Hub remains private to its opener + executives. It is intentionally
-    # not exposed to every support/department role.
+    # Staff Hub stays private to the opener + executives.
     if category_name == "Staff Hub":
         opener_id = app.get_user_id_from_channel(channel.id)
         if opener_id:
@@ -219,8 +216,7 @@ def ticket_overwrites(app, guild, channel, category_name):
 
     permitted_roles = roles_for_ticket(category_name)
 
-    # Role access gives visibility only. Sending is granted per-member after a
-    # current grammar pass so one unqualified person cannot inherit Send Messages.
+    # Roles grant visibility only. A current grammar pass grants member-level Send.
     for role_name in sorted(permitted_roles):
         role = find_role(guild, role_name)
         if role:
@@ -246,7 +242,6 @@ async def sync_support_category(app, guild):
         role = find_role(guild, role_name)
         if role:
             overwrites[role] = writer()
-    # Core support can see the category, but channel-level qualification controls sending.
     for role_name in sorted(CORE_SUPPORT):
         role = find_role(guild, role_name)
         if role:
@@ -394,7 +389,6 @@ class GrammarTestView(discord.ui.View):
 
 
 async def dm_grammar_test(app, member):
-    state = grammar_state(app, member.guild.id)
     embed = discord.Embed(
         title="Weekly Customer Support Grammar Check",
         description=(
@@ -455,7 +449,7 @@ async def assign_ticket_to_staff(app, guild, channel, user, tried_ids=None):
         await channel.send(chosen.mention)
     except (discord.Forbidden, discord.HTTPException):
         pass
-    app.bot.loop.create_task(app.ticket_reassign_monitor(channel, user, chosen.id, tried_ids))
+    asyncio.create_task(app.ticket_reassign_monitor(channel, user, chosen.id, tried_ids))
 
 
 def setup(app):
@@ -465,9 +459,6 @@ def setup(app):
 
     original_open_ticket = app.open_ticket
 
-    # Original ticket creation consults this set. Narrow it immediately; the
-    # authoritative channel overwrite replacement below then removes any legacy
-    # configured Director access left by the old function.
     app.TICKET_ACCESS_ROLE_NAMES = set(EXECUTIVES) | set(CORE_SUPPORT)
 
     def qualified_support(member):
@@ -495,7 +486,6 @@ def setup(app):
 
     app.assign_ticket_to_staff = assign_ticket_wrapper
 
-    # Persistent DM button survives bot restarts.
     app.bot.add_view(GrammarTestView(app))
 
     guild_obj = discord.Object(id=app.GUILD_ID)
@@ -524,7 +514,6 @@ def setup(app):
         state["passes"] = {}
         app.save_data()
 
-        # New cycle immediately removes old per-member Send Messages allows.
         await sync_all_open_tickets(app, guild)
 
         eligible = [
@@ -552,14 +541,26 @@ def setup(app):
 
     app.tree.add_command(grammer, guild=guild_obj, override=True)
 
+    async def grammar_expiry_watch():
+        await app.bot.wait_until_ready()
+        while not app.bot.is_closed():
+            await asyncio.sleep(3600)
+            guild = app.bot.get_guild(app.GUILD_ID)
+            if guild:
+                try:
+                    await sync_all_open_tickets(app, guild)
+                except Exception as exc:
+                    print(f"GRAMMAR EXPIRY SYNC ERROR: {exc}", flush=True)
+
     async def on_ready_ticket_access():
-        # V15/V16 finishes public/category repair first, then this becomes the
-        # authoritative Support Tickets permission pass.
         await asyncio.sleep(14)
         guild = app.bot.get_guild(app.GUILD_ID)
         if not guild:
             return
         await sync_all_open_tickets(app, guild)
+        if not getattr(app, "_grammar_expiry_task_started", False):
+            app._grammar_expiry_task_started = True
+            asyncio.create_task(grammar_expiry_watch())
         print(
             "TICKET ACCESS READY: executives + support base; department option access; weekly grammar gating active.",
             flush=True,
@@ -610,22 +611,10 @@ def setup(app):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    async def grammar_expiry_watch():
-        await app.bot.wait_until_ready()
-        while not app.bot.is_closed():
-            await asyncio.sleep(3600)
-            guild = app.bot.get_guild(app.GUILD_ID)
-            if guild:
-                try:
-                    await sync_all_open_tickets(app, guild)
-                except Exception as exc:
-                    print(f"GRAMMAR EXPIRY SYNC ERROR: {exc}", flush=True)
-
     app.bot.add_listener(on_ready_ticket_access, "on_ready")
     app.bot.add_listener(on_guild_channel_create_ticket_access, "on_guild_channel_create")
     app.bot.add_listener(on_member_update_ticket_access, "on_member_update")
     app.bot.add_listener(grammar_message_guard, "on_message")
-    app.bot.loop.create_task(grammar_expiry_watch())
 
     print(
         "Ticket grammar/access module loaded: /grammer + department routing + executive exemption.",
