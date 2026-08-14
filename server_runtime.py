@@ -5,8 +5,8 @@ def setup(app):
     import role_sync
     role_sync.setup(app)
 
-    import server_layout_v14
-    server_layout_v14.setup(app)
+    import server_layout_v15
+    server_layout_v15.setup(app)
 
     import log_channels
     log_channels.setup(app)
@@ -24,6 +24,6 @@ def setup(app):
     server_export.setup(app)
 
     print(
-        "Ryanair server sync ready: layout V14 authoritative Information/Bulletin rank locks loaded.",
+        "Ryanair server sync ready: layout V15 guaranteed category-backed rank locks loaded.",
         flush=True,
     )
