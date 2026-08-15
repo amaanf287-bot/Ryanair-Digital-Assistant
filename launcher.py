@@ -4,7 +4,7 @@ import traceback
 
 import discord
 
-print("RYANAIR LAUNCHER v7 — early slash-command repair + Ryanair runtime", flush=True)
+print("RYANAIR LAUNCHER v8 — command repair + bot quality + Ryanair runtime", flush=True)
 
 
 def _normalise_numeric_env(name: str, default: str | None = None) -> None:
@@ -48,9 +48,9 @@ if os.getenv("DEPARTURES_CHANNEL_ID"):
 
 import bot as app
 
-# Load the command-slot replacement independently of the larger runtime chain.
-# This guarantees /massrole is removed and /channel annoucments is registered
-# before the bot connects, even if a later server integration has an error.
+# Load critical command fixes independently of the larger runtime chain. This
+# guarantees the current slash-command tree exists before the bot connects even
+# if a later server integration has an error.
 try:
     import command_slot_swap
     command_slot_swap.setup(app)
@@ -58,15 +58,18 @@ try:
     import channel_announcements
     channel_announcements.setup(app)
 
+    import bot_quality
+    bot_quality.setup(app)
+
     import slash_command_repair
     slash_command_repair.setup(app)
 
     print(
-        "EARLY SLASH REPAIR READY — /massrole removed locally; /channel annoucments registered before login.",
+        "EARLY BOT QUALITY READY — /channel registered, /massrole removed, polished commands loaded before login.",
         flush=True,
     )
 except Exception as exc:
-    print(f"EARLY SLASH REPAIR ERROR — {type(exc).__name__}: {exc}", flush=True)
+    print(f"EARLY BOT QUALITY ERROR — {type(exc).__name__}: {exc}", flush=True)
     traceback.print_exc()
 
 # Apply the live Ryanair-only hierarchy and branding before commands are used.
