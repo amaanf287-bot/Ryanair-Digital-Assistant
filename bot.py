@@ -839,16 +839,28 @@ async def log_ticket_transcript(direction, channel, author, content, attachments
 
 
 async def global_tree_interaction_check(interaction: discord.Interaction):
-    command_name = interaction.command.qualified_name if interaction.command else str((interaction.data or {}).get("name", "unknown"))
-    channel_text = interaction.channel.mention if getattr(interaction.channel, "mention", None) else f"DM / {interaction.channel_id}"
-    detail = (
-        f"**Command:** `/{command_name}`\n"
-        f"**Channel:** {channel_text}\n"
-        f"**User ID:** `{interaction.user.id}`\n"
-        f"**Options:** `{safe_interaction_options(interaction)}`"
-    )
-    log_action(interaction.user.id, f"/{command_name}", detail)
-    asyncio.create_task(log_to_channel("Command Run", detail, interaction.user, 0x3498DB))
+    # This check must NEVER prevent a valid slash command from reaching its
+    # command callback. Logging is best-effort and is deliberately isolated.
+    try:
+        command_name = interaction.command.qualified_name if interaction.command else str((interaction.data or {}).get("name", "unknown"))
+        channel_text = interaction.channel.mention if getattr(interaction.channel, "mention", None) else f"DM / {interaction.channel_id}"
+        detail = (
+            f"**Command:** `/{command_name}`\n"
+            f"**Channel:** {channel_text}\n"
+            f"**User ID:** `{interaction.user.id}`\n"
+            f"**Options:** `{safe_interaction_options(interaction)}`"
+        )
+        try:
+            log_action(interaction.user.id, f"/{command_name}", detail)
+        except Exception as log_error:
+            print(f"COMMAND LOG WARNING — {type(log_error).__name__}: {log_error}", flush=True)
+        try:
+            asyncio.create_task(log_to_channel("Command Run", detail, interaction.user, 0x3498DB))
+        except Exception as log_error:
+            print(f"COMMAND CHANNEL LOG WARNING — {type(log_error).__name__}: {log_error}", flush=True)
+    except Exception as check_error:
+        print(f"INTERACTION CHECK WARNING — {type(check_error).__name__}: {check_error}", flush=True)
+
     guild = bot.get_guild(GUILD_ID)
     if interaction.user.id in raid_locked and guild and not is_protected_account(interaction.user, guild):
         await interaction.response.send_message(
