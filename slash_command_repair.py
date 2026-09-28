@@ -31,10 +31,10 @@ def setup(app):
         return
     app._slash_command_repair_loaded = True
 
-    original_sync = app.sync_ryanair_slash_commands
+    original_sync = app.sync_jet2_slash_commands
     guild_obj = discord.Object(id=app.GUILD_ID)
 
-    async def repaired_sync_ryanair_slash_commands():
+    async def repaired_sync_jet2_slash_commands():
         # Make absolutely sure the old command cannot be re-sent from the local
         # tree, regardless of which earlier module registered it.
         app.tree.remove_command("massrole", guild=guild_obj)
@@ -82,7 +82,7 @@ def setup(app):
         print("Synced slash commands: " + ", ".join(synced_names), flush=True)
         return synced
 
-    app.sync_ryanair_slash_commands = repaired_sync_ryanair_slash_commands
+    app.sync_jet2_slash_commands = repaired_sync_jet2_slash_commands
 
     print(
         "Slash command repair loaded: remote /massrole purge + /channel verification enabled.",
