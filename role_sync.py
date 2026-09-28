@@ -80,7 +80,7 @@ def setup(app):
              "director": app.DIRECTOR_PERMISSIONS, "executive": app.EXECUTIVE_PERMISSIONS, "owner": app.OWNER_PERMISSIONS,
              "tag": app.TAG_PERMISSIONS}
     blueprints = [app.role_spec("Ryanair Digital Assistant", {"Jet2.rblx Digital Assistant", "Jet2 Digital Assistant"},
-                                app.RYANAIR_YELLOW, app.STAFF_PERMISSIONS, hoist=True, create_if_missing=False)]
+                                app.JET2_YELLOW, app.STAFF_PERMISSIONS, hoist=True, create_if_missing=False)]
     for divider, roles in SECTIONS:
         blueprints.append(app.divider_spec(divider))
         for name, colour, tier, hoist, aliases in roles:
