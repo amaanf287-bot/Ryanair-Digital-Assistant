@@ -74,8 +74,8 @@ except Exception as exc:
 
 # Apply the live Jet2-only hierarchy and branding before commands are used.
 try:
-    import jet2_runtime
-    jet2_runtime.setup(app)
+    import ryanair_runtime
+    ryanair_runtime.setup(app)
     print("Jet2 role hierarchy and branding ready.", flush=True)
 except Exception as exc:
     print(f"JET2 RUNTIME ERROR — {type(exc).__name__}: {exc}", flush=True)
