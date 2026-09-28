@@ -1,4 +1,4 @@
-"""Professional Ryanair Discord server rebuild and rank-locked channel layout.
+"""Professional Jet2 Discord server rebuild and rank-locked channel layout.
 
 /setupserver is intentionally destructive for channels: it preserves an existing
 Staff Hub category/channel, removes other channels/categories, then creates the
@@ -104,15 +104,26 @@ def _bot_overwrite():
 
 
 def _public_overwrites(guild: discord.Guild, *, read_only=False):
-    everyone = discord.PermissionOverwrite(
-        view_channel=True,
-        read_message_history=True,
-        send_messages=False if read_only else True,
-        add_reactions=True,
-        connect=True,
-        speak=True,
-    )
+    # Rank-lock every public channel: @everyone cannot view them.
+    everyone = discord.PermissionOverwrite(view_channel=False)
     data = {guild.default_role: everyone}
+    for role_name in {
+        getattr(app, "JET2_DEFAULT_ACCESS_ROLE", "Verified"),
+        getattr(app, "JET2_MEMBER_ROLE", "Member"),
+        getattr(app, "JET2_PASSENGER_ROLE", "Passenger"),
+        getattr(app, "JET2_NEWS_ROLE", "Jet2 News"),
+    }:
+        role = _role(guild, role_name)
+        if role:
+            data[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=False if read_only else True,
+                add_reactions=True,
+                use_application_commands=True,
+                connect=True,
+                speak=True,
+            )
     if guild.me:
         data[guild.me] = _bot_overwrite()
     return data
@@ -171,7 +182,7 @@ async def _ensure_roles(app, guild: discord.Guild, actor) -> tuple[list[str], li
                     permissions=normal_permissions,
                     hoist=spec.get("hoist", False),
                     mentionable=spec.get("mentionable", False),
-                    reason=f"Professional Ryanair server rebuild requested by {actor}",
+                    reason=f"Professional Jet2 server rebuild requested by {actor}",
                 )
                 created.append(spec["target"])
             except (discord.Forbidden, discord.HTTPException) as exc:
@@ -208,7 +219,7 @@ async def _ensure_roles(app, guild: discord.Guild, actor) -> tuple[list[str], li
                     permissions=normal_permissions,
                     hoist=hoist,
                     mentionable=mentionable,
-                    reason=f"Professional Ryanair role created by {actor}",
+                    reason=f"Professional Jet2 role created by {actor}",
                 )
                 created.append(name)
             except (discord.Forbidden, discord.HTTPException) as exc:
@@ -258,7 +269,7 @@ async def _ensure_roles(app, guild: discord.Guild, actor) -> tuple[list[str], li
         "5": "Executive Access",
         "4": "Executive Board",
         "3": "Senior Management",
-        "2": "Ryanair Staff Team",
+        "2": "Jet2 Staff Team",
         "1": "Recruitment Talent Pool",
         "ticket_role": "Customer Support Officer",
     }
@@ -313,13 +324,13 @@ async def _create_text(guild, category, name, *, topic=None, read_only=False, ov
         name,
         category=category,
         topic=topic,
-        overwrites=overwrites,
-        reason="Professional Ryanair server layout",
+        overwrites=overwrites if overwrites is not None else category.overwrites,
+        reason="Professional Jet2 server layout",
     )
 
 
 async def _create_category(guild, name, overwrites):
-    return await guild.create_category(name, overwrites=overwrites, reason="Professional Ryanair server layout")
+    return await guild.create_category(name, overwrites=overwrites, reason="Professional Jet2 server layout")
 
 
 async def _build_layout(app, guild: discord.Guild, preserve_ids):
@@ -333,15 +344,15 @@ async def _build_layout(app, guild: discord.Guild, preserve_ids):
     information = await _create_category(guild, "Information", _public_overwrites(guild))
     for name, topic in [
         ("rules", "Official community rules and conduct."),
-        ("information", "Ryanair Roblox community information."),
-        ("ryanair-help", "Frequently asked questions and help."),
+        ("information", "Jet2 Roblox community information."),
+        ("jet2-help", "Frequently asked questions and help."),
         ("travel-assistant", "Ask for travel and community assistance."),
     ]:
         created[name] = await _create_text(guild, information, name, topic=topic)
 
     bulletin = await _create_category(guild, "Bulletin", _public_overwrites(guild, read_only=True))
     for name, topic in [
-        ("announcements", "Official Ryanair community announcements."),
+        ("announcements", "Official Jet2 community announcements."),
         ("press-releases", "Official press releases and major updates."),
         ("development", "Development progress and release notes."),
         ("careers", "Community staffing and application notices."),
@@ -372,8 +383,8 @@ async def _build_layout(app, guild: discord.Guild, preserve_ids):
     created["community-posts"] = await _create_text(guild, community, "community-posts", topic="Community posts and discussion.")
 
     voice = await _create_category(guild, "Community Voice", _public_overwrites(guild))
-    created["voice-chat"] = await guild.create_voice_channel("Voice Chat", category=voice, reason="Professional Ryanair server layout")
-    created["voice-chat-2"] = await guild.create_voice_channel("Voice Chat 2", category=voice, reason="Professional Ryanair server layout")
+    created["voice-chat"] = await guild.create_voice_channel("Voice Chat", category=voice, reason="Professional Jet2 server layout")
+    created["voice-chat-2"] = await guild.create_voice_channel("Voice Chat 2", category=voice, reason="Professional Jet2 server layout")
 
     # Recruitment / trainee area — Level 1+.
     recruitment_access = _roles_at_or_above(app, 1)
@@ -411,8 +422,8 @@ async def _build_layout(app, guild: discord.Guild, preserve_ids):
 
     executive_names = set(app.ROLE_LEVEL_NAMES.get(5, set())) | {
         "Group Chief Operating Officer",
-        "Ryanair DAC Chief Executive Officer",
-        "Ryanair UK Chief Executive Officer",
+        "Jet2 DAC Chief Executive Officer",
+        "Jet2 UK Chief Executive Officer",
         "Buzz Chief Executive Officer",
         "Malta Air Chief Executive Officer",
         "Lauda Europe Chief Executive Officer",
@@ -526,7 +537,7 @@ def setup(app):
 
     @app_commands.command(
         name="setupserver",
-        description="Rebuild the Ryanair server layout and rank locks (Owner only)",
+        description="Rebuild the Jet2 server layout and rank locks (Owner only)",
     )
     async def setupserver_rebuild(interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -536,7 +547,7 @@ def setup(app):
 
         guild = interaction.guild
         if not guild:
-            await interaction.followup.send("Run this inside the Ryanair server.", ephemeral=True)
+            await interaction.followup.send("Run this inside the Jet2 server.", ephemeral=True)
             return
         me = guild.me
         required = me and me.guild_permissions.manage_channels and me.guild_permissions.manage_roles
@@ -550,7 +561,7 @@ def setup(app):
         # Warn in DM before any destructive changes begin.
         try:
             await interaction.user.send(
-                "Ryanair server rebuild started. Existing **Staff Hub** is being preserved; other channels/categories are being replaced."
+                "Jet2 server rebuild started. Existing **Staff Hub** is being preserved; other channels/categories are being replaced."
             )
         except (discord.Forbidden, discord.HTTPException):
             pass
@@ -577,7 +588,7 @@ def setup(app):
             layout_failure = f"{type(exc).__name__}: {exc}"
 
         summary = (
-            "Ryanair server rebuild finished.\n\n"
+            "Jet2 server rebuild finished.\n\n"
             f"Roles created: **{len(created_roles)}**\n"
             f"Roles normalised: **{len(updated_roles)}**\n"
             f"Old channels/categories removed: **{len(deleted)}**\n"
