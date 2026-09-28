@@ -14,12 +14,13 @@ load_dotenv()
 JET2_SERVER_NAME = os.getenv("JET2_SERVER_NAME", "Jet2.com Roblox")
 JET2_BRAND_NAME = os.getenv("JET2_BRAND_NAME", "Jet2")
 JET2_BOT_NAME = os.getenv("JET2_BOT_NAME", "Jet2 Digital Assistant")
-JET2_DEFAULT_ACCESS_ROLE = os.getenv("JET2_DEFAULT_ACCESS_ROLE", "Verified")
-JET2_MEMBER_ROLE = os.getenv("JET2_MEMBER_ROLE", "Member")
-JET2_PASSENGER_ROLE = os.getenv("JET2_PASSENGER_ROLE", "Passenger")
-JET2_STAFF_ROLE = os.getenv("JET2_STAFF_ROLE", "Staff")
-JET2_MANAGEMENT_ROLE = os.getenv("JET2_MANAGEMENT_ROLE", "Jet2 Senior Management")
-JET2_NEWS_ROLE = os.getenv("JET2_NEWS_ROLE", "Jet2 News")
+# Core role names are kept in code so Railway only needs the actual ID variables.
+JET2_DEFAULT_ACCESS_ROLE = "Verified"
+JET2_MEMBER_ROLE = "Member"
+JET2_PASSENGER_ROLE = "Passenger"
+JET2_STAFF_ROLE = "Staff"
+JET2_MANAGEMENT_ROLE = "Jet2 Senior Management"
+JET2_NEWS_ROLE = "Jet2 News"
 JET2_LOG_CHANNEL_NAME = os.getenv("JET2_LOG_CHANNEL_NAME", "action-logs")
 JET2_TICKET_CATEGORY_NAME = os.getenv("JET2_TICKET_CATEGORY_NAME", "Support Tickets")
 JET2_ANNOUNCEMENT_CHANNEL_NAME = os.getenv("JET2_ANNOUNCEMENT_CHANNEL_NAME", "announcements")
