@@ -4,7 +4,7 @@ import traceback
 
 import discord
 
-print("RYANAIR LAUNCHER v8 — command repair + bot quality + Ryanair runtime", flush=True)
+print("JET2 LAUNCHER v8 — command repair + bot quality + Jet2 runtime", flush=True)
 
 
 def _normalise_numeric_env(name: str, default: str | None = None) -> None:
@@ -72,16 +72,16 @@ except Exception as exc:
     print(f"EARLY BOT QUALITY ERROR — {type(exc).__name__}: {exc}", flush=True)
     traceback.print_exc()
 
-# Apply the live Ryanair-only hierarchy and branding before commands are used.
+# Apply the live Jet2-only hierarchy and branding before commands are used.
 try:
-    import ryanair_runtime
-    ryanair_runtime.setup(app)
-    print("Ryanair role hierarchy and branding ready.", flush=True)
+    import jet2_runtime
+    jet2_runtime.setup(app)
+    print("Jet2 role hierarchy and branding ready.", flush=True)
 except Exception as exc:
-    print(f"RYANAIR RUNTIME ERROR — {type(exc).__name__}: {exc}", flush=True)
+    print(f"JET2 RUNTIME ERROR — {type(exc).__name__}: {exc}", flush=True)
     traceback.print_exc()
 
-# Load Ryanair Music, then install the direct message-command bridge. The bridge
+# Load Jet2 Music, then install the direct message-command bridge. The bridge
 # makes !acceptmusicrules / !music / !commands work even with bot.py's custom
 # on_message handler.
 try:
@@ -91,9 +91,9 @@ try:
     import music_prefix_bridge
     music_prefix_bridge.setup(app.bot, music_manager)
 
-    print("Ryanair Music ready.", flush=True)
+    print("Jet2 Music ready.", flush=True)
 except Exception as exc:
-    print(f"RYANAIR MUSIC ERROR — {type(exc).__name__}: {exc}", flush=True)
+    print(f"JET2 MUSIC ERROR — {type(exc).__name__}: {exc}", flush=True)
     traceback.print_exc()
 
 
@@ -117,23 +117,23 @@ async def main() -> None:
     if not app.TOKEN:
         raise RuntimeError("DISCORD_TOKEN is missing from Railway variables.")
 
-    configured_clients = [("Ryanair primary bot", app.bot, app.TOKEN)]
+    configured_clients = [("Jet2 primary bot", app.bot, app.TOKEN)]
 
     if app.AUTOMATION_TOKEN:
         if app.AUTOMATION_TOKEN == app.TOKEN:
             print("AUTOMATION_TOKEN matches DISCORD_TOKEN; duplicate login skipped.", flush=True)
         else:
-            configured_clients.append(("Ryanair automation bot", app.auto_bot, app.AUTOMATION_TOKEN))
+            configured_clients.append(("Jet2 automation bot", app.auto_bot, app.AUTOMATION_TOKEN))
     else:
-        print("AUTOMATION_TOKEN is missing; Ryanair automation bot skipped.", flush=True)
+        print("AUTOMATION_TOKEN is missing; Jet2 automation bot skipped.", flush=True)
 
-    if app.RYANAIR_FLIGHT_TOKEN:
-        if app.RYANAIR_FLIGHT_TOKEN in {app.TOKEN, app.AUTOMATION_TOKEN}:
-            print("RYANAIR_FLIGHT_TOKEN matches another token; duplicate login skipped.", flush=True)
+    if app.JET2_FLIGHT_TOKEN:
+        if app.JET2_FLIGHT_TOKEN in {app.TOKEN, app.AUTOMATION_TOKEN}:
+            print("JET2_FLIGHT_TOKEN matches another token; duplicate login skipped.", flush=True)
         else:
-            configured_clients.append(("Ryanair flight bot", app.ryanair_flight_bot, app.RYANAIR_FLIGHT_TOKEN))
+            configured_clients.append(("Jet2 flight bot", app.jet2_flight_bot, app.JET2_FLIGHT_TOKEN))
     else:
-        print("RYANAIR_FLIGHT_TOKEN is missing; Ryanair flight bot skipped.", flush=True)
+        print("JET2_FLIGHT_TOKEN is missing; Jet2 flight bot skipped.", flush=True)
 
     tasks = [
         asyncio.create_task(start_client(label, client, token), name=label)
@@ -141,7 +141,7 @@ async def main() -> None:
     ]
 
     await asyncio.gather(*tasks)
-    raise RuntimeError("All configured Ryanair Discord clients stopped.")
+    raise RuntimeError("All configured Jet2 Discord clients stopped.")
 
 
 if __name__ == "__main__":
