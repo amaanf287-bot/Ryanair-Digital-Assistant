@@ -108,10 +108,10 @@ def _public_overwrites(guild: discord.Guild, *, read_only=False):
     everyone = discord.PermissionOverwrite(view_channel=False)
     data = {guild.default_role: everyone}
     for role_name in {
-        getattr(app, "JET2_DEFAULT_ACCESS_ROLE", "Verified"),
-        getattr(app, "JET2_MEMBER_ROLE", "Member"),
-        getattr(app, "JET2_PASSENGER_ROLE", "Passenger"),
-        getattr(app, "JET2_NEWS_ROLE", "Jet2 News"),
+        "Verified",
+        "Member",
+        "Passenger",
+        "Jet2 News",
     }:
         role = _role(guild, role_name)
         if role:
