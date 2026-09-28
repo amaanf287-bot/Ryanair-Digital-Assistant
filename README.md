@@ -1,54 +1,61 @@
-JET2.RBLX BOT — TICKETS, APPLICATIONS, PAX FLIGHTS, LOGGING AND ANTI-RAID
+# Jet2 Digital Assistant — Discord Automation
 
-DEPLOYMENT
-1. Replace the bot.py in your GitHub repository with this bot.py.
-2. Keep your existing Railway variables.
-3. Add the two variables below using the actual Discord user IDs:
-   RYAN_USER_ID=your_discord_user_id
-   RYLAN_USER_ID=rylans_discord_user_id
-4. Commit/push the change, then deploy the latest commit in Railway.
-5. Check the Railway deploy log for the command sync message.
+This repository is now configured for the **Jet2 Roblox** Discord server.
 
-REQUIRED CORE RAILWAY VARIABLES
-DISCORD_TOKEN
-GUILD_ID
-TICKET_CATEGORY_ID
-LOG_CHANNEL_ID
-ANNOUNCEMENT_CHANNEL_ID
-DEPARTURES_CHANNEL_ID
-GROQ_API_KEY
-RYAN_USER_ID
-RYLAN_USER_ID
+## Railway variables
 
-OPTIONAL
-ANTI_RAID_TIMEOUT_DAYS=28
-AUTOMATION_TOKEN
-JET2_FLIGHT_TOKEN
+Add these in **Railway → Variables**. The code reads them automatically at startup.
 
-BOT PERMISSIONS NEEDED
-View Audit Log
-Manage Server
-Manage Roles
-Manage Channels
-Moderate Members
-Kick Members
-Ban Members
-Create Invite
-Manage Events
-Send Messages
-Embed Links
-Attach Files
-Add Reactions
-Read Message History
+### Required
+- `DISCORD_TOKEN`
+- `GUILD_ID`
+- `TICKET_CATEGORY_ID`
+- `LOG_CHANNEL_ID`
+- `ANNOUNCEMENT_CHANNEL_ID`
+- `DEPARTURES_CHANNEL_ID`
+- `GROQ_API_KEY`
 
-IMPORTANT
-- Put the bot role ABOVE every staff role it may need to remove, restore or manage.
-- The anti-raid system detects actions through Discord audit logs, rolls back where Discord permits, and locks the responsible staff account. It cannot stop the first Discord API action before it occurs.
-- Deleted message history cannot be recreated. A kicked member cannot be forced back, so the bot attempts to DM a one-use invite.
-- AI is OFF in tickets by default. It only starts after staff run /aideal. /connect and any staff reply turn AI OFF.
-- Ticket inactivity warning is sent after 8 hours; automatic closure occurs 3 hours later if nobody replies.
-- /paxflight now calls the shared flight implementation directly.
-- The file contains an estimated 99 root slash commands/groups, below Discord's 100 guild CHAT_INPUT command limit.
+### Bot/automation tokens
+- `AUTOMATION_TOKEN` — optional second Discord bot token
+- `JET2_FLIGHT_TOKEN` — optional flight bot token
 
-VALIDATION
-The Python file passed syntax compilation and static command checks. It was not connected to a live Discord server in this environment.
+### Owner / anti-raid
+- `RYAN_USER_ID`
+- `RYLAN_USER_ID`
+- `ANTI_RAID_TIMEOUT_DAYS`
+
+### Jet2 branding and server configuration
+- `JET2_SERVER_NAME`
+- `JET2_BRAND_NAME`
+- `JET2_BOT_NAME`
+- `JET2_DEFAULT_ACCESS_ROLE`
+- `JET2_MEMBER_ROLE`
+- `JET2_PASSENGER_ROLE`
+- `JET2_STAFF_ROLE`
+- `JET2_MANAGEMENT_ROLE`
+- `JET2_NEWS_ROLE`
+- `JET2_LOG_CHANNEL_NAME`
+- `JET2_TICKET_CATEGORY_NAME`
+- `JET2_ANNOUNCEMENT_CHANNEL_NAME`
+- `JET2_DEPARTURES_CHANNEL_NAME`
+- `JET2_VERIFY_CHANNEL_NAME`
+- `JET2_WEBSITE_URL`
+- `JET2_ROBLOX_GROUP_URL`
+- `JET2_APPLICATION_URL`
+- `JET2_SUPPORT_URL`
+- `JET2_SERVER_ICON_URL`
+- `JET2_BANNER_URL`
+- `JET2_PRIMARY_COLOR`
+- `JET2_SECONDARY_COLOR`
+- `JET2_TIMEZONE`
+- `JET2_PREFIX`
+
+## Channel access
+
+The server rebuild now treats **every channel as rank-locked**. Public/reference channels deny `@everyone` and grant access through the configured Jet2 access roles. Staff, management, director, executive, operations, recruitment, support, development and log categories retain their more restrictive role locks.
+
+## Deployment
+
+Railway can automatically deploy the new GitHub commit if the Railway service is connected to this repository. **Railway environment variables are not created from GitHub automatically** because tokens and secrets must remain private; add the variable names above once in Railway and fill in your values.
+
+The bot requires the Discord permissions needed for its moderation, channel, role, ticket, logging and server-rebuild features.
