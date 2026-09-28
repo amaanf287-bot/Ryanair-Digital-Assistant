@@ -839,55 +839,52 @@ async def log_ticket_transcript(direction, channel, author, content, attachments
 
 
 async def global_tree_interaction_check(interaction: discord.Interaction):
-    # This check must NEVER prevent a valid slash command from reaching its
-    # command callback. Logging is best-effort and is deliberately isolated.
+    # Keep this check completely non-blocking. Disk/network logging here can
+    # delay the interaction long enough for Discord to show "did not respond".
     try:
-        command_name = interaction.command.qualified_name if interaction.command else str((interaction.data or {}).get("name", "unknown"))
-        channel_text = interaction.channel.mention if getattr(interaction.channel, "mention", None) else f"DM / {interaction.channel_id}"
-        detail = (
-            f"**Command:** `/{command_name}`\n"
-            f"**Channel:** {channel_text}\n"
-            f"**User ID:** `{interaction.user.id}`\n"
-            f"**Options:** `{safe_interaction_options(interaction)}`"
-        )
-        try:
-            log_action(interaction.user.id, f"/{command_name}", detail)
-        except Exception as log_error:
-            print(f"COMMAND LOG WARNING — {type(log_error).__name__}: {log_error}", flush=True)
-        try:
-            asyncio.create_task(log_to_channel("Command Run", detail, interaction.user, 0x3498DB))
-        except Exception as log_error:
-            print(f"COMMAND CHANNEL LOG WARNING — {type(log_error).__name__}: {log_error}", flush=True)
+        guild = bot.get_guild(GUILD_ID)
+        if interaction.user.id in raid_locked and guild and not is_protected_account(interaction.user, guild):
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Your account is anti-raid locked. Ryan or Rylan must unlock it before you can use bot commands.",
+                    ephemeral=True,
+                )
+            return False
     except Exception as check_error:
         print(f"INTERACTION CHECK WARNING — {type(check_error).__name__}: {check_error}", flush=True)
-
-    guild = bot.get_guild(GUILD_ID)
-    if interaction.user.id in raid_locked and guild and not is_protected_account(interaction.user, guild):
-        await interaction.response.send_message(
-            "Your account is anti-raid locked. Ryan or Rylan must unlock it before you can use bot commands.",
-            ephemeral=True,
-        )
-        return False
     return True
 
-# CommandTree.interaction_check is designed to be overridden globally.
 tree.interaction_check = global_tree_interaction_check
 
 
 @tree.error
 async def global_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure) and interaction.user.id in raid_locked:
-        return
-    command_name = interaction.command.qualified_name if interaction.command else "unknown"
-    detail = f"**Command:** `/{command_name}`\n**Error:** `{type(error).__name__}: {str(error)[:2500]}`"
-    asyncio.create_task(log_to_channel("Command Error", detail, interaction.user, 0xE74C3C))
-    if not interaction.response.is_done():
-        await interaction.response.send_message("The command hit an error. It has been recorded in the logging channel.", ephemeral=True)
-    else:
-        try:
-            await interaction.followup.send("The command hit an error. It has been recorded in the logging channel.", ephemeral=True)
-        except discord.HTTPException:
-            pass
+    try:
+        command_name = interaction.command.qualified_name if interaction.command else str((interaction.data or {}).get("name", "unknown"))
+    except Exception:
+        command_name = "unknown"
+    print(
+        f"SLASH COMMAND ERROR — /{command_name} — {type(error).__name__}: {str(error)[:2000]}",
+        flush=True,
+    )
+    try:
+        detail = "Command: /{}\nError: {}: {}".format(command_name, type(error).__name__, str(error)[:2500])
+        asyncio.create_task(log_to_channel("Command Error", detail, interaction.user, 0xE74C3C))
+    except Exception as log_error:
+        print(f"COMMAND ERROR LOG WARNING — {type(log_error).__name__}: {log_error}", flush=True)
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"The command could not complete: {type(error).__name__}. Check the bot logs for details.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"The command could not complete: {type(error).__name__}. Check the bot logs for details.",
+                ephemeral=True,
+            )
+    except Exception as response_error:
+        print(f"COMMAND ERROR RESPONSE WARNING — {type(response_error).__name__}: {response_error}", flush=True)
 
 AI_SYSTEM_STAFF = (
     "You are the Jet2 Digital Assistant for a Roblox aviation community.\n"
