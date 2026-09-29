@@ -90,8 +90,10 @@ async def _health_report(app):
         missing = [name for name in required if not getattr(perms, name, False)]
 
     remote_names = set()
+    remote_count = 0
     try:
         remote = await app.tree.fetch_commands(guild=discord.Object(id=app.GUILD_ID))
+        remote_count = len(remote)
         remote_names = {cmd.name.casefold() for cmd in remote}
     except Exception as exc:
         print(f"BOT QUALITY COMMAND CHECK WARNING — {type(exc).__name__}: {exc}", flush=True)
@@ -101,8 +103,12 @@ async def _health_report(app):
         "BOT QUALITY HEALTH — "
         f"guild={guild.name!r} ({guild.id}), members={guild.member_count}, "
         f"channels={len(guild.channels)}, roles={len(guild.roles)}, latency={latency_ms}ms, "
+        f"slash_commands={remote_count}/100, "
         f"/channel={'YES' if 'channel' in remote_names else 'NO'}, "
+        f"/ping={'YES' if 'ping' in remote_names else 'NO'}, "
+        f"/commands={'YES' if 'commands' in remote_names else 'NO'}, "
         f"/massrole={'YES' if 'massrole' in remote_names else 'NO'}, "
+        f"/unconnected={'YES' if 'unconnected' in remote_names else 'NO'}, "
         f"missing_permissions={','.join(missing) if missing else 'none'}",
         flush=True,
     )
@@ -235,7 +241,7 @@ def setup(app):
                 (
                     "Common Ticket Tools",
                     _command_line(
-                        "connect", "unconnected", "closerequest", "close", "onhold",
+                        "connect", "closerequest", "close", "onhold",
                         "ticketnote", "ticketsummary", "requeststaff", "anonreply",
                         "aideal", "say", "supporttickets",
                     ),
