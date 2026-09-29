@@ -66,6 +66,10 @@ def setup(app):
         problems = []
         if "channel" not in guild_names:
             problems.append("/channel is missing from Discord's guild command list")
+        if "commands" not in guild_names:
+            problems.append("/commands is missing from Discord's guild command list")
+        if len(remote_guild) > 100:
+            problems.append(f"Discord guild command limit exceeded: {len(remote_guild)}/100")
         if "massrole" in guild_names:
             problems.append("/massrole still exists as a guild command")
         if "unconnected" in guild_names:
@@ -82,7 +86,7 @@ def setup(app):
         print(
             "SLASH REPAIR VERIFIED — "
             f"guild_deleted={guild_deleted}, global_deleted={global_deleted}, "
-            f"remote_guild_count={len(remote_guild)}, /channel=YES, /ping=YES, /massrole=NO, /unconnected=NO",
+            f"remote_guild_count={len(remote_guild)}, /channel=YES, /ping=YES, /commands=YES, /massrole=NO, /unconnected=NO",
             flush=True,
         )
         print("Synced slash commands: " + ", ".join(synced_names), flush=True)
