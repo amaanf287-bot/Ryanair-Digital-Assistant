@@ -465,8 +465,10 @@ def setup(app):
 
         await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
-    app.tree.add_command(forceranklocks, guild=guild_obj, override=True)
-    app.tree.add_command(checklocks, guild=guild_obj, override=True)
+    # Keep these callbacks in the file, but do not register them as slash
+    # commands: the guild is already at Discord's 100-command limit.
+    app.tree.remove_command("forceranklocks", guild=guild_obj)
+    app.tree.remove_command("checklocks", guild=guild_obj)
 
     print(
         "Professional server layout V15 loaded: category-backed authoritative rank locks + watchdog.",
