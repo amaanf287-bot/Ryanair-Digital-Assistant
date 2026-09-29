@@ -39,6 +39,8 @@ def setup(app):
         # tree, regardless of which earlier module registered it.
         app.tree.remove_command("massrole", guild=guild_obj)
         app.tree.remove_command("massrole")
+        app.tree.remove_command("unconnected", guild=guild_obj)
+        app.tree.remove_command("unconnected")
 
         # Delete any stale remote copies before the bulk guild sync. This covers
         # both old guild registrations and any historical global registration.
@@ -66,6 +68,10 @@ def setup(app):
             problems.append("/channel is missing from Discord's guild command list")
         if "massrole" in guild_names:
             problems.append("/massrole still exists as a guild command")
+        if "unconnected" in guild_names:
+            problems.append("/unconnected still exists as a guild command")
+        if "ping" not in guild_names:
+            problems.append("/ping is missing from Discord's guild command list")
         if "massrole" in global_names:
             problems.append("/massrole still exists as a global command")
 
@@ -76,7 +82,7 @@ def setup(app):
         print(
             "SLASH REPAIR VERIFIED — "
             f"guild_deleted={guild_deleted}, global_deleted={global_deleted}, "
-            f"remote_guild_count={len(remote_guild)}, /channel=YES, /massrole=NO",
+            f"remote_guild_count={len(remote_guild)}, /channel=YES, /ping=YES, /massrole=NO, /unconnected=NO",
             flush=True,
         )
         print("Synced slash commands: " + ", ".join(synced_names), flush=True)
