@@ -48,6 +48,26 @@ if os.getenv("DEPARTURES_CHANNEL_ID"):
 
 import bot as app
 
+# Discord allows a maximum of 100 guild slash commands. The current bot had
+# already filled all 100 slots, which prevented essential commands such as
+# /ping from being registered. Retire the old diagnostic /unconnected command
+# and reserve its slot for a direct health-check command.
+app.tree.remove_command("unconnected", guild=discord.Object(id=app.GUILD_ID))
+app.tree.remove_command("unconnected")
+
+@app.tree.command(
+    name="ping",
+    description="Check that the Jet2 Digital Assistant is responding.",
+    guild=discord.Object(id=app.GUILD_ID),
+)
+async def ping_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        f"🏓 Pong! Jet2 Digital Assistant is online. `{round(app.bot.latency * 1000)}ms`",
+        ephemeral=True,
+    )
+
+print("COMMAND CAPACITY FIX: /unconnected retired; /ping reserved in the 100-command guild slot.", flush=True)
+
 # Load critical command fixes independently of the larger runtime chain. This
 # guarantees the current slash-command tree exists before the bot connects even
 # if a later server integration has an error.
